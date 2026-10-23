@@ -10,6 +10,8 @@
 //  GitHub   https://github.com/hpssjellis
 //  LinkedIn https://www.linkedin.com/in/jeremy-ellis-4237a9bb/
 //
+//  IMPORTANT USING THE ARDUINO IDE INSTALL THE LIBRARY WebSockets by Markus Sattler 
+//
 // -----------------------------------------------------------------------------
 //  NEW IN v001: THE DEVICE LINK  (one text protocol, several ways to connect)
 //    USB serial   the page's Serial monitor (section 8), as before
