@@ -70,9 +70,13 @@ Use this when there is no router. If the board cannot join your WiFi, it makes i
 
 1. Power the board. Look for the WiFi network **XIAO-Vision** (password `xiaovision`) and join it with your computer.
    (Your computer has no internet while joined. That is fine.)
-2. Start the helper: `node server-v001.js`
-3. In section 9 leave the address as it is: `ws://localhost:8080/dev/192.168.4.1`
-4. Press **Connect WiFi**, then **Send weights to device**.
+2. # Initialize a new Node project (press Enter to accept defaults)
+```npm init -y```
+3. # Install the required websocket library specified in your file comments
+```npm install ws```
+3. Start the helper: `node server.js`
+4. In section 9 leave the address as it is: `ws://localhost:8080/dev/192.168.4.1`
+5. Press **Connect WiFi**, then **Send weights to device**.
 
 ---
 
