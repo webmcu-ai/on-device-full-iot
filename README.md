@@ -12,9 +12,9 @@ You have three files:
 
 | File | What it is |
 |---|---|
-| `firmware-v002.ino` | The program for the board (Arduino IDE) |
-| `index-v002.html` | The web page where you collect pictures and train |
-| `server-v001.js` | A tiny helper program, only needed for the WiFi ways (Way 3 and 4) |
+| `firmware.ino` | The program for the board (Arduino IDE) |
+| `index.html` | The web page where you collect pictures and train |
+| `server.js` | A tiny helper program, only needed for the WiFi ways (Way 3 and 4) |
 
 ## One-time setup
 
