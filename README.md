@@ -58,8 +58,9 @@ Close the Arduino Serial Monitor first, because only one program can use the por
 
 Faster than USB. The board and the computer must be on the **same WiFi**.
 
-1. Type your WiFi name and password at the top of the firmware (`myWifiSsid`, `myWifiPass`) and upload.
-2. Start the helper on your computer: open a terminal in the folder and run `node server-v001.js`.
+1. Type your WiFi name and password at the top of the firmware (`myWifiSsid`, `myWifiPass`) and upload.2.  Initialize a new Node project (press Enter to accept defaults)  `npm init -y`
+3.  Install the required websocket library specified in your file comments`n pm install ws`
+2. Start the helper on your computer: open a terminal in the folder and run `node server.js`.
 3. In section 9 change the address to `ws://localhost:8080/dev/xiao-vision.local`
    (if that name does not work, use the board's number, like `ws://localhost:8080/dev/192.168.1.57`; the board prints it in the Serial Monitor at start-up).
 4. Press **Connect WiFi**, then **Send weights to device**.
@@ -70,10 +71,8 @@ Use this when there is no router. If the board cannot join your WiFi, it makes i
 
 1. Power the board. Look for the WiFi network **XIAO-Vision** (password `xiaovision`) and join it with your computer.
    (Your computer has no internet while joined. That is fine.)
-2. # Initialize a new Node project (press Enter to accept defaults)
-```npm init -y```
-3. # Install the required websocket library specified in your file comments
-```npm install ws```
+2.  Initialize a new Node project (press Enter to accept defaults)`npm init -y`
+3.  Install the required websocket library specified in your file comments`npm install ws`
 3. Start the helper: `node server.js`
 4. In section 9 leave the address as it is: `ws://localhost:8080/dev/192.168.4.1`
 5. Press **Connect WiFi**, then **Send weights to device**.
