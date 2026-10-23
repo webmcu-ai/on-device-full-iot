@@ -29,3 +29,139 @@ HARD RULES
 
 HOW TO WORK
 Look in /mnt/user-data/uploads first. Edit the real files with patch scripts (each text replacement must match exactly once), syntax-check the page's JavaScript with node, test server-v001.js with an echo board, then give me the complete files named *-v002. Keep replies short. Tell me plainly what you could not test.
+
+
+
+
+possible helpful code
+
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+
+// Replace with your network credentials
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Create AsyncWebServer object on port 80
+AsyncWebServer server(80);
+// Create a WebSocket object on the path /ws
+AsyncWebSocket ws("/ws");
+
+// Simple HTML web page served directly from the ESP32 flash memory
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 WebSocket Server</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial; text-align: center; margin-top: 50px; }
+        .btn { padding: 15px 30px; font-size: 24px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h2>ESP32 WebSocket Demo</h2>
+    <button class="btn" onclick="sendMessage()">Send Hello</button>
+    <p>Server Response: <span id="response">None</span></p>
+
+<script>
+    // Automatically detect host IP and target the /ws route
+    var gateway = `ws://${window.location.hostname}/ws`;
+    var websocket;
+    
+    window.addEventListener('load', onload);
+
+    function onload(event) {
+        initWebSocket();
+    }
+
+    function initWebSocket() {
+        console.log('Trying to open a WebSocket connection...');
+        websocket = new WebSocket(gateway);
+        websocket.onopen    = onOpen;
+        websocket.onclose   = onClose;
+        websocket.onmessage = onMessage;
+    }
+
+    function onOpen(event) {
+        console.log('Connection opened');
+    }
+
+    function onClose(event) {
+        console.log('Connection closed');
+        setTimeout(initWebSocket, 2000); // Try to reconnect every 2 seconds
+    }
+
+    function onMessage(event) {
+        console.log("Data received: " + event.data);
+        document.getElementById('response').innerHTML = event.data;
+    }
+
+    function sendMessage() {
+        websocket.send('Hello from Browser!');
+    }
+</script>
+</body>
+</html>
+)rawliteral";
+
+// Handle incoming WebSocket events
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+               void *arg, uint8_t *data, size_t len) {
+    
+    switch (type) {
+        case WS_EVT_CONNECT:
+            Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+            client->text("Connected to ESP32!");
+            break;
+        case WS_EVT_DISCONNECT:
+            Serial.printf("WebSocket client #%u disconnected\n", client->id());
+            break;
+        case WS_EVT_DATA:
+            // Handle incoming data packet
+            AwsFrameInfo *info = (AwsFrameInfo*)arg;
+            if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+                data[len] = 0; // Null-terminate string
+                String message = (char*)data;
+                Serial.printf("Received message: %s\n", message.c_str());
+                
+                // Echo back message or perform an action (like changing a GPIO state)
+                client->text("ESP32 received your: " + message);
+            }
+            break;
+        case WS_EVT_PONG:
+        case WS_EVT_ERROR:
+            break;
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    // Connect to Wi-Fi network
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("");
+    Serial.print("Connected! IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // Attach WebSocket handler to the server path
+    ws.onEvent(onWsEvent);
+    server.addHandler(&ws);
+
+    // Serve the root index.html page
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", index_html);
+    });
+
+    // Start server
+    server.begin();
+}
+
+void loop() {
+    // Periodically clean up disconnected clients to free up heap memory
+    ws.cleanupClients();
+}
