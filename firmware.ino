@@ -1,5 +1,5 @@
 // =============================================================================
-//  XIAO ESP32S3 SENSE / XIAO ML KIT  -  FULL VISION ML  -  firmware-v002  (WiFi link)
+//  XIAO ESP32S3 SENSE / XIAO ML KIT  -  FULL VISION ML  -  firmware-v004  (USB + WiFi + Bluetooth link)
 //
 //  Collect small images, train a tiny CNN, and classify what the camera sees,
 //  all on the microcontroller. A companion web page can do the training faster.
@@ -11,6 +11,34 @@
 //  LinkedIn https://www.linkedin.com/in/jeremy-ellis-4237a9bb/
 //
 // -----------------------------------------------------------------------------
+//  NEW IN v004: ONE TEXT PROTOCOL ON USB, WiFi AND BLUETOOTH, WITH FILE TRANSFER
+//    The page's "Connect USB serial", "Connect WiFi" and "Connect Bluetooth" buttons all talk to the same code below
+//    (you normally use one at a time). Type a command in the page's send box, or in the Arduino serial monitor:
+//        t  l  x  1..9                 menu keys (t next/capture, l select/exit, x stop training, digits jump)
+//        @info                         layout, class names, SD and weights state
+//        @snap                         one camera picture:  @J <n> <base64 jpeg>
+//        @ls <folder>                  list a folder:  @L <size> <name> lines, then  Y,ls|<count>   (size -1 = folder)
+//        @stat <path>                  file size:  Y,stat|<bytes>
+//        @read <offset> <len> <path>   one piece (up to 1536 bytes):  @D <offset> <sum> <base64>
+//        @put <bytes> <sum> <path>     start an image upload (path /images/<class>/<file>); then  @w<offset>,<sum>,<base64>
+//        @cfg <json>                   save /header/config.json         @model <bytes> <sum>  weights push (as before)
+//    Paths may start with /images or /header. The page uses @read for "Download model / config.json / images"
+//    and @model for "Upload model", @cfg for "Upload config.json", @put for "Upload images".
+//    Bluetooth (MY_USE_BLE): library "NimBLE-Arduino" version 2.x. Set MY_USE_BLE to 0 to leave it out.
+//    Bluetooth is slower than WiFi or USB: keep debug frames off and expect minutes, not seconds, for big files.
+//
+//  NEW IN v003: EVERYTHING THE WEBCAM CAN DO, THE BOARD CAN NOW DO OVER USB OR WiFI
+//    - "@snap"  the page asks for ONE camera picture; the board answers with one line  "@J <n> <base64 jpeg>".
+//               The page can use it like a webcam frame: capture, burst, live preview, live inference.
+//    - Menu keys over WiFi: the page's remote buttons send t, l, x and the digits 1..9 as single-character
+//               WebSocket messages. They share one small key queue with the USB serial keys, so the menu,
+//               collect, train and infer modes all react to USB keys and WiFi keys alike.
+//    - "@info"  the board answers  "Y,info|<ver>|<size>|<c1>|<c2>|<class,class,...>|sd=0/1|w=0/1"
+//               so the page can copy the board's layout and class names (no typing, no mismatch).
+//    - "@cfg <json>"  the page sends config.json (class names); the board saves it to the SD card and reads it.
+//    - Not changed: SD folder and zip, weights push, debug frames, any input size, lazy training memory.
+//    - Coming next: Web Bluetooth and LoRa (each will get its own MY_USE_* switch).
+//
 //  NEW IN v002: boot-crash hardening for ESP32 Arduino core 3.x
 //    - WiFi no longer starts in STA mode and then switches to AP when no router is set
 //      (it goes straight to its own XIAO-Vision network).
@@ -29,7 +57,7 @@
 //        @model <bytes> <sum>     start; <sum> = every byte added up (uint32)
 //        @h<offset>,<hex>,<sum>   USB only: one chunk as hex. WiFi sends raw binary frames instead.
 //    Library to install: "WebSockets" by Markus Sattler. Set MY_USE_WIFI to 0 to leave WiFi out.
-//    Coming next: Web Bluetooth, LoRa network monitor, Node bridge (server-v001.js).
+//    Server helpers for classrooms: server-v004.js (Node) or server-v004.py (Python).
 //    ARDUINO IDE RULE: every variable and function is declared near the top, so order never matters.
 //
 // -----------------------------------------------------------------------------
@@ -103,7 +131,7 @@
   #include "myWeights.h"
 #endif
 
-// ---- WiFi settings (v002) ---------------------------------------------------
+// ---- WiFi settings ---------------------------------------------------
 #define MY_USE_WIFI 1                      // 1 = WiFi + WebSocket link, 0 = USB serial only
 const char* myWifiSsid = "";               // your router; leave empty to always use the board's own network
 const char* myWifiPass = "";
@@ -111,6 +139,14 @@ const char* myApSsid   = "XIAO-Vision";    // fallback network the board makes (
 const char* myApPass   = "xiaovision";
 const char* myHostName = "xiao-vision";    // page address xiao-vision.local
 const unsigned long myWifiTimeoutMs = 12000;
+
+// ---- Bluetooth settings (v004) -------------------------------------------------
+#define MY_USE_BLE 1                       // 1 = Web Bluetooth link (needs library NimBLE-Arduino 2.x), 0 = leave it out
+const char* myBleName = "XIAO-Vision";
+#define MY_BLE_SERVICE_UUID "7a1b0001-5d7c-4f6e-9a3e-0f2c4b1d8e01"
+#define MY_BLE_RX_UUID      "7a1b0002-5d7c-4f6e-9a3e-0f2c4b1d8e01"   // the page writes commands here
+#define MY_BLE_TX_UUID      "7a1b0003-5d7c-4f6e-9a3e-0f2c4b1d8e01"   // the board sends lines here (notify)
+#define MY_BLE_RING 4096                   // bytes the page may have in flight
 
 #include "esp_camera.h"
 #include "img_converters.h"
@@ -126,6 +162,9 @@ const unsigned long myWifiTimeoutMs = 12000;
   #include <WiFi.h>
   #include <ESPmDNS.h>
   #include <WebSocketsServer.h>
+#endif
+#if MY_USE_BLE
+  #include <NimBLEDevice.h>
 #endif
 
 
@@ -339,6 +378,33 @@ bool     myLkActive = false;               // a weights transfer is running
 bool     myLkCapture = false;              // collecting an @command line from the serial port
 String   myLkLine;                         // that line
 
+// ---- Keys from WiFi (v003): a tiny queue shared with the USB serial keys ----
+char     myKeyQueue[16];                   // keys sent by the page's remote buttons
+uint8_t  myKeyHead = 0;                    // next free place
+uint8_t  myKeyTail = 0;                    // next key to read
+bool     myLkSnapWanted = false;           // the page sent "@snap": answered in myLkPoll() where the camera is free
+unsigned long myLkSnapCount = 0;           // pictures sent to the page so far
+
+// ---- Image upload from the page (v004): "@put" then "@w" pieces ----
+bool     myPutActive = false;              // an image upload is running
+uint8_t* myPutBuf = nullptr;               // the file so far (PSRAM), freed when done
+size_t   myPutTotal = 0;                   // bytes expected
+size_t   myPutGot = 0;                     // bytes received so far
+uint32_t myPutSum = 0;                     // byte-sum the page promised
+String   myPutPath;                        // where the file goes on the SD card
+
+// ---- Bluetooth (v004) ----
+#if MY_USE_BLE
+NimBLEServer*         myBleServer = nullptr;
+NimBLECharacteristic* myBleTx = nullptr;   // board -> page (notify)
+bool     myBleConnected = false;
+uint16_t myBleMtu = 23;                    // grows when the page and board agree on a bigger packet size
+uint8_t  myBleRxRing[MY_BLE_RING];         // bytes written by the page, read in the main loop (never in the BLE task)
+volatile uint16_t myBleRxHead = 0;
+volatile uint16_t myBleRxTail = 0;
+String   myBleRxLine;                      // the command being collected
+#endif
+
 
 // =============================================================================
 //  FORWARD DECLARATIONS  (every function, so the order below does not matter)
@@ -393,6 +459,35 @@ void   myLkHandleLine(const String& line);
 void   myLkAppend(const uint8_t* d, size_t n);
 void   myLkFinish();
 int    myLkHex(char c);
+void   myLkServeSnap();
+void   myLkInfo();
+void   myLkWriteConfig(const String& json);
+void   myKeyPush(char c);
+bool   myKeyAvailable();
+char   myKeyRead();
+bool   myLkPathOk(const String& p);
+void   myLkStat(String path);
+void   myLkList(String path);
+void   myLkRead(const String& args);
+void   myLkPutBegin(const String& args);
+void   myLkPutChunk(const String& line);
+void   myLkPutFinish();
+void   myLkBleBegin();
+void   myBleService();
+void   myBleFeed(char c);
+void   myBleSend(const char* s, size_t n);
+#if MY_USE_BLE
+class MyBleServerCb : public NimBLEServerCallbacks {
+ public:
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override;
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override;
+  void onMTUChange(uint16_t mtu, NimBLEConnInfo& connInfo) override;
+};
+class MyBleRxCb : public NimBLECharacteristicCallbacks {
+ public:
+  void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override;
+};
+#endif
 #if MY_USE_WIFI
 void   myLkWsEvent(uint8_t num, WStype_t type, uint8_t* p, size_t len);
 #endif
@@ -433,7 +528,7 @@ void setup() {
   while (!Serial && millis() < 3000);
   delay(1000);
 
-  Serial.println("\n=== XIAO ESP32S3 Vision ML (firmware-v002) ===");
+  Serial.println("\n=== XIAO ESP32S3 Vision ML (firmware-v004) ===");
   Serial.printf("Layout: INPUT_SIZE %d, CONV1_FILTERS %d, CONV2_FILTERS %d, NUM_CLASSES %d\n",
                 INPUT_SIZE, CONV1_FILTERS, CONV2_FILTERS, NUM_CLASSES);
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
@@ -521,6 +616,7 @@ void setup() {
 
   Serial.println("[boot 3] camera done"); Serial.flush();
   myLkWifiBegin();         // WiFi + WebSocket link (does nothing when MY_USE_WIFI is 0)
+  myLkBleBegin();          // Bluetooth link (does nothing when MY_USE_BLE is 0)
 
   Serial.println("[boot 9] allocating model memory"); Serial.flush();
   myAllocateMemory();      // inference memory + random starting weights
@@ -1202,6 +1298,8 @@ void myLkPoll() {
 #if MY_USE_WIFI
   if (myWifiUp) myWs.loop();
 #endif
+  myBleService();                       // commands that arrived over Bluetooth
+  myLkServeSnap();                      // answer a "@snap" request (works on every link)
 }
 
 // One line to the USB serial and to the WiFi page (when connected).
@@ -1210,6 +1308,9 @@ void myLkEmit(const char* s, size_t n) {
   Serial.println();
 #if MY_USE_WIFI
   if (myWifiUp && myWsClient >= 0) myWs.sendTXT((uint8_t)myWsClient, s, n);
+#endif
+#if MY_USE_BLE
+  if (myBleConnected && myBleTx) myBleSend(s, n);
 #endif
 }
 
@@ -1226,7 +1327,7 @@ bool myLkHandleChar(char c) {
   }
   if (c == '\r') return true;
   if (c == '\n') { myLkCapture = false; myLkHandleLine(myLkLine); myLkLine = ""; return true; }
-  if (myLkLine.length() < 700) myLkLine += c;
+  if (myLkLine.length() < 2000) myLkLine += c;
   return true;
 }
 
@@ -1276,6 +1377,14 @@ void myLkHandleLine(const String& line) {
     myLkAppend(tmp, (size_t)n);
     return;
   }
+  if (line.startsWith("@stat ")) { myLkStat(line.substring(6)); return; }
+  if (line.startsWith("@ls "))   { myLkList(line.substring(4)); return; }
+  if (line.startsWith("@read ")) { myLkRead(line.substring(6)); return; }
+  if (line.startsWith("@put "))  { myLkPutBegin(line.substring(5)); return; }
+  if (line.startsWith("@w"))     { myLkPutChunk(line); return; }
+  if (line == "@snap") { myLkSnapWanted = true; return; }          // answered in myLkPoll()
+  if (line == "@info") { myLkInfo(); return; }
+  if (line.startsWith("@cfg ")) { myLkWriteConfig(line.substring(5)); return; }
   myLkReply("E,unknown command");
 }
 
@@ -1313,6 +1422,303 @@ void myLkFinish() {
   myLkReply(String("Y,weights loaded") + (mySDavailable ? " and saved to SD" : " (no SD card, RAM only)"));
 }
 
+// One camera picture for the page: "@J <n> <base64 jpeg>". Called from myLkPoll(), when no loop holds a frame.
+void myLkServeSnap() {
+  if (!myLkSnapWanted) return;
+  myLkSnapWanted = false;
+  if (!myCameraOk) { myLkReply("E,camera not working"); return; }
+  camera_fb_t* old = esp_camera_fb_get();          // throw one frame away: it may be old
+  if (old) esp_camera_fb_return(old);
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { myLkReply("E,no camera frame"); return; }
+  size_t cap = 40 + ((fb->len + 2) / 3) * 4;
+  char* b = (char*)ps_malloc(cap);
+  if (!b) { esp_camera_fb_return(fb); myLkReply("E,not enough PSRAM for a picture"); return; }
+  myLkSnapCount++;
+  size_t o = snprintf(b, cap, "@J %lu ", myLkSnapCount);
+  o += myB64(b + o, cap - o, fb->buf, fb->len);
+  b[o] = 0;
+  esp_camera_fb_return(fb);
+  myLkEmit(b, o);
+  free(b);
+}
+
+// "@info" -> Y,info|version|input size|conv1|conv2|class names|sd=0/1|w=0/1
+void myLkInfo() {
+  String s = String("Y,info|v004|") + String((int)INPUT_SIZE) + "|" + String((int)CONV1_FILTERS) + "|" + String((int)CONV2_FILTERS) + "|";
+  for (int i = 0; i < NUM_CLASSES; i++) { if (i) s += ","; s += myClassLabels[i]; }
+  s += mySDavailable ? "|sd=1" : "|sd=0";
+  s += myWeightsTrained ? "|w=1" : "|w=0";
+  myLkReply(s);
+}
+
+// "@cfg <json>": save config.json on the SD card, then read the class names from it (same as at boot).
+void myLkWriteConfig(const String& json) {
+  if (!mySDavailable) { myLkReply("E,no SD card, config.json not saved"); return; }
+  if (json.length() < 2 || json.length() > 4000) { myLkReply("E,config.json size not accepted"); return; }
+  if (!SD.exists("/header")) SD.mkdir("/header");
+  File f = SD.open("/header/config.json", FILE_WRITE);
+  if (!f) { myLkReply("E,could not open config.json"); return; }
+  f.print(json);
+  f.close();
+  myLoadConfig();
+  myLkReply("Y,config.json saved and read");
+}
+
+// =============================================================================
+//  FILES ON THE BOARD (v004): list, size, read pieces, receive images. Same on USB, WiFi and Bluetooth.
+// =============================================================================
+
+// Only /images and /header can be reached, and never with "..".
+bool myLkPathOk(const String& p) {
+  if (p.length() < 2 || p.length() > 120 || p.indexOf("..") >= 0) return false;
+  return p == "/images" || p == "/header" || p.startsWith("/images/") || p.startsWith("/header/");
+}
+
+// "@stat <path>" -> Y,stat|<bytes>
+void myLkStat(String path) {
+  path.trim();
+  if (!mySDavailable) { myLkReply("E,no SD card"); return; }
+  if (!myLkPathOk(path) || !SD.exists(path)) { myLkReply("E,not found"); return; }
+  File f = SD.open(path, FILE_READ);
+  if (!f) { myLkReply("E,cannot open"); return; }
+  size_t n = f.isDirectory() ? 0 : (size_t)f.size();
+  f.close();
+  myLkReply("Y,stat|" + String((unsigned)n));
+}
+
+// "@ls <folder>" -> one "@L <size> <name>" line per entry (size -1 = folder), then Y,ls|<count>
+void myLkList(String path) {
+  path.trim();
+  if (!mySDavailable) { myLkReply("E,no SD card"); return; }
+  if (!myLkPathOk(path) || !SD.exists(path)) { myLkReply("E,not found"); return; }
+  File d = SD.open(path);
+  if (!d || !d.isDirectory()) { if (d) d.close(); myLkReply("E,not a folder"); return; }
+  int count = 0;
+  while (true) {
+    File f = d.openNextFile();
+    if (!f) break;
+    String nm = String(f.name());
+    int sl = nm.lastIndexOf('/');
+    if (sl >= 0) nm = nm.substring(sl + 1);
+    String line = String("@L ") + (f.isDirectory() ? String(-1) : String((unsigned)f.size())) + " " + nm;
+    f.close();
+    myLkEmit(line.c_str(), line.length());
+    count++;
+  }
+  d.close();
+  myLkReply("Y,ls|" + String(count));
+}
+
+// "@read <offset> <len> <path>" -> "@D <offset> <sum> <base64>"  (len 1..1536, sum = bytes added up)
+void myLkRead(const String& args) {
+  int s1 = args.indexOf(' ');
+  int s2 = (s1 > 0) ? args.indexOf(' ', s1 + 1) : -1;
+  if (s1 < 0 || s2 < 0) { myLkReply("E,bad @read line"); return; }
+  size_t off = (size_t)args.substring(0, s1).toInt();
+  int len = args.substring(s1 + 1, s2).toInt();
+  String path = args.substring(s2 + 1);
+  path.trim();
+  if (len < 1 || len > 1536) { myLkReply("E,length must be 1 to 1536"); return; }
+  if (!mySDavailable) { myLkReply("E,no SD card"); return; }
+  if (!myLkPathOk(path) || !SD.exists(path)) { myLkReply("E,not found"); return; }
+  File f = SD.open(path, FILE_READ);
+  if (!f) { myLkReply("E,cannot open"); return; }
+  static uint8_t tmp[1536];
+  static char out[2200];
+  int got = 0;
+  if (f.seek(off)) got = (int)f.read(tmp, (size_t)len);
+  f.close();
+  if (got <= 0) { myLkReply("E,nothing to read there"); return; }
+  uint32_t sum = 0;
+  for (int i = 0; i < got; i++) sum += tmp[i];
+  size_t o = snprintf(out, sizeof(out), "@D %u %lu ", (unsigned)off, (unsigned long)sum);
+  o += myB64(out + o, sizeof(out) - o, tmp, (size_t)got);
+  out[o] = 0;
+  myLkEmit(out, o);
+}
+
+// "@put <bytes> <sum> <path>": the page will now send "@w" pieces. Only /images/<class>/<file> is accepted.
+void myLkPutBegin(const String& args) {
+  int s1 = args.indexOf(' ');
+  int s2 = (s1 > 0) ? args.indexOf(' ', s1 + 1) : -1;
+  if (s1 < 0 || s2 < 0) { myLkReply("E,bad @put line"); return; }
+  size_t n = (size_t)args.substring(0, s1).toInt();
+  uint32_t sum = (uint32_t)strtoul(args.substring(s1 + 1, s2).c_str(), NULL, 10);
+  String path = args.substring(s2 + 1);
+  path.trim();
+  if (!mySDavailable) { myLkReply("E,no SD card"); return; }
+  int slashes = 0;
+  for (unsigned i = 0; i < path.length(); i++) if (path[i] == '/') slashes++;
+  if (!path.startsWith("/images/") || !myLkPathOk(path) || slashes != 3) { myLkReply("E,uploads go to /images/<class>/<file> only"); return; }
+  if (n < 1 || n > 300000) { myLkReply("E,size not accepted"); return; }
+  if (myPutBuf) { free(myPutBuf); myPutBuf = nullptr; }
+  myPutBuf = (uint8_t*)ps_malloc(n);
+  if (!myPutBuf) { myLkReply("E,not enough PSRAM for this file"); return; }
+  myPutPath = path; myPutTotal = n; myPutGot = 0; myPutSum = sum; myPutActive = true;
+  myLkReply("A,0");
+}
+
+// "@w<offset>,<sum>,<base64>": one piece. Answers A,<bytes so far>; a wrong piece just repeats where it is.
+void myLkPutChunk(const String& line) {
+  if (!myPutActive || !myPutBuf) { myLkReply("E,no upload in progress"); return; }
+  int c1 = line.indexOf(',');
+  int c2 = (c1 > 0) ? line.indexOf(',', c1 + 1) : -1;
+  if (c1 < 0 || c2 < 0) { myLkReply("A," + String((unsigned)myPutGot)); return; }
+  size_t off = (size_t)line.substring(2, c1).toInt();
+  uint32_t want = (uint32_t)strtoul(line.substring(c1 + 1, c2).c_str(), NULL, 10);
+  if (off != myPutGot) { myLkReply("A," + String((unsigned)myPutGot)); return; }
+  static uint8_t tmp[1600];
+  size_t olen = 0;
+  String b64 = line.substring(c2 + 1);
+  int rc = mbedtls_base64_decode(tmp, sizeof(tmp), &olen, (const unsigned char*)b64.c_str(), b64.length());
+  uint32_t sum = 0;
+  for (size_t i = 0; i < olen; i++) sum += tmp[i];
+  if (rc != 0 || olen == 0 || sum != want || myPutGot + olen > myPutTotal) { myLkReply("A," + String((unsigned)myPutGot)); return; }
+  memcpy(myPutBuf + myPutGot, tmp, olen);
+  myPutGot += olen;
+  myLkReply("A," + String((unsigned)myPutGot));
+  if (myPutGot == myPutTotal) myLkPutFinish();
+}
+
+// Checks the whole byte-sum, makes the folders, writes the file.
+void myLkPutFinish() {
+  myPutActive = false;
+  uint32_t s = 0;
+  for (size_t i = 0; i < myPutTotal; i++) s += myPutBuf[i];
+  if (s != myPutSum) { free(myPutBuf); myPutBuf = nullptr; myLkReply("E,checksum mismatch, nothing saved"); return; }
+  if (!SD.exists("/images")) SD.mkdir("/images");
+  String folder = myPutPath.substring(0, myPutPath.lastIndexOf('/'));
+  if (!SD.exists(folder)) SD.mkdir(folder);
+  File f = SD.open(myPutPath, FILE_WRITE);
+  if (!f) { free(myPutBuf); myPutBuf = nullptr; myLkReply("E,could not write the file"); return; }
+  f.write(myPutBuf, myPutTotal);
+  f.close();
+  free(myPutBuf); myPutBuf = nullptr;
+  myLkReply("Y,saved " + myPutPath);
+}
+
+// ---- Keys: WiFi keys wait in a small queue, USB keys come straight from Serial ----
+void myKeyPush(char c) {
+  uint8_t next = (uint8_t)((myKeyHead + 1) % 16);
+  if (next == myKeyTail) return;                   // queue full: drop the key
+  myKeyQueue[myKeyHead] = c;
+  myKeyHead = next;
+}
+
+bool myKeyAvailable() {
+  return (myKeyHead != myKeyTail) || (Serial.available() > 0);
+}
+
+char myKeyRead() {
+  bool serialFirst = myLkCapture && (Serial.available() > 0);      // never mix a WiFi key into a USB @ line
+  if (myKeyHead != myKeyTail && !serialFirst) {
+    char c = myKeyQueue[myKeyTail];
+    myKeyTail = (uint8_t)((myKeyTail + 1) % 16);
+    return c;
+  }
+  return (char)Serial.read();
+}
+
+// =============================================================================
+//  BLUETOOTH (v004): the page writes lines to the RX characteristic, the board notifies lines on TX.
+//  The BLE task only drops bytes into a ring; myBleService() (called from myLkPoll) does the real work,
+//  so the SD card and the camera are never touched from two tasks at once.
+// =============================================================================
+#if MY_USE_BLE
+void MyBleServerCb::onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
+  myBleConnected = true;
+  myBleMtu = 23;
+  myBleRxHead = 0; myBleRxTail = 0;
+}
+void MyBleServerCb::onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) {
+  myBleConnected = false;
+  myDebugStream = false;
+  NimBLEDevice::startAdvertising();                // be findable again
+}
+void MyBleServerCb::onMTUChange(uint16_t mtu, NimBLEConnInfo& connInfo) {
+  myBleMtu = mtu;
+}
+void MyBleRxCb::onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) {
+  NimBLEAttValue v = pCharacteristic->getValue();
+  const uint8_t* d = v.data();
+  size_t n = v.length();
+  for (size_t i = 0; i < n; i++) {
+    uint16_t next = (uint16_t)((myBleRxHead + 1) % MY_BLE_RING);
+    if (next == myBleRxTail) break;                // ring full: drop (the page waits for answers, so this should not happen)
+    myBleRxRing[myBleRxHead] = d[i];
+    myBleRxHead = next;
+  }
+}
+#endif
+
+void myLkBleBegin() {
+#if MY_USE_BLE
+  Serial.println("[boot 8b] Bluetooth start"); Serial.flush();
+  NimBLEDevice::init(myBleName);
+  NimBLEDevice::setMTU(247);
+  myBleServer = NimBLEDevice::createServer();
+  myBleServer->setCallbacks(new MyBleServerCb());
+  NimBLEService* svc = myBleServer->createService(MY_BLE_SERVICE_UUID);
+  myBleTx = svc->createCharacteristic(MY_BLE_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
+  NimBLECharacteristic* rx = svc->createCharacteristic(MY_BLE_RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  rx->setCallbacks(new MyBleRxCb());
+  svc->start();
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(MY_BLE_SERVICE_UUID);
+  adv->enableScanResponse(true);
+  adv->start();
+  Serial.printf("Bluetooth ready. In the page press Connect Bluetooth and pick \"%s\"\n", myBleName);
+#endif
+}
+
+// Called from myLkPoll(): turns the bytes the page wrote into lines.
+void myBleService() {
+#if MY_USE_BLE
+  while (myBleRxTail != myBleRxHead) {
+    char c = (char)myBleRxRing[myBleRxTail];
+    myBleRxTail = (uint16_t)((myBleRxTail + 1) % MY_BLE_RING);
+    myBleFeed(c);
+  }
+#endif
+}
+
+// A line ending in a newline: "@..." is a command, anything else is menu keys (t l x 1..9, D, d).
+void myBleFeed(char c) {
+#if MY_USE_BLE
+  if (c == '\r') return;
+  if (c != '\n') { if (myBleRxLine.length() < 2100) myBleRxLine += c; return; }
+  String t = myBleRxLine;
+  myBleRxLine = "";
+  if (t.length() == 0) return;
+  if (t[0] == '@') { myLkHandleLine(t); return; }
+  for (unsigned i = 0; i < t.length(); i++) {
+    char k = t[i];
+    if (k == 'D' || k == 'd') myHandleDebugChar(k);
+    else if (k > ' ') myKeyPush(k);
+  }
+#endif
+}
+
+// One line to the page, in pieces that fit the Bluetooth packet size, then a newline.
+void myBleSend(const char* s, size_t n) {
+#if MY_USE_BLE
+  size_t chunk = (myBleMtu > 23) ? (size_t)(myBleMtu - 3) : 20;
+  if (chunk > 240) chunk = 240;
+  static const uint8_t myNewline = '\n';
+  size_t o = 0;
+  while (o <= n) {                                  // o == n sends the final newline
+    size_t take;
+    if (o == n) { myBleTx->setValue(&myNewline, 1); take = 1; }
+    else { take = (n - o > chunk) ? chunk : (n - o); myBleTx->setValue((const uint8_t*)s + o, take); }
+    int tries = 0;
+    while (!myBleTx->notify() && tries++ < 200) delay(3);
+    o += take;
+    delay(2);
+  }
+#endif
+}
+
 #if MY_USE_WIFI
 void myLkWsEvent(uint8_t num, WStype_t type, uint8_t* p, size_t len) {
   if (type == WStype_CONNECTED) {
@@ -1322,11 +1728,14 @@ void myLkWsEvent(uint8_t num, WStype_t type, uint8_t* p, size_t len) {
   } else if (type == WStype_DISCONNECTED) {
     if (myWsClient == (int)num) { myWsClient = -1; myDebugStream = false; }
   } else if (type == WStype_TEXT) {
-    if (len == 1) { myHandleDebugChar((char)p[0]); }          // 'D' / 'd' heartbeat from the page
-    else if (len > 1) {
+    if (len == 1 && (p[0] == 'D' || p[0] == 'd')) {
+      myHandleDebugChar((char)p[0]);                         // 'D' / 'd' heartbeat from the page
+    } else if (len > 0 && p[0] == '@') {                     // @model, @snap, @info, @cfg ...
       String t; t.reserve(len);
       for (size_t i = 0; i < len; i++) t += (char)p[i];
       myLkHandleLine(t);
+    } else {                                                 // anything else is menu keys: t l x 1..9
+      for (size_t i = 0; i < len; i++) if (p[i] > ' ') myKeyPush((char)p[i]);
     }
   } else if (type == WStype_BIN) {
     myLkAppend(p, len);                                        // weights chunk (raw bytes)
@@ -1469,8 +1878,8 @@ void myActionCollect(int classIdx) {
     }
 
     // Serial keys.
-    if (Serial.available()) {
-      char c = Serial.read();
+    if (myKeyAvailable()) {
+      char c = myKeyRead();
       if (myHandleDebugChar(c)) {
         // handled: the web page is asking for debug frames
       } else if (c == 'l' || c == 'L') {
@@ -1728,8 +2137,8 @@ void myUpdateWeights(int step) {
 // True when the user asked to stop (serial 'x' or 'l', or 3+ taps on the touch pad).
 bool myTrainingExitRequested() {
   myLkPoll();
-  if (Serial.available()) {
-    char c = Serial.read();
+  if (myKeyAvailable()) {
+    char c = myKeyRead();
     if (c == 'x' || c == 'X' || c == 'l' || c == 'L') {
       Serial.println("Stopping training...");
       return true;
@@ -1970,8 +2379,8 @@ void myActionTrain() {
     Serial.println("  Serial: t = train again   l = exit");
     Serial.println("  Touch:  1-2 taps = train again   3+ taps = exit");
     while (true) {
-      if (Serial.available()) {
-        char c = Serial.read();
+      if (myKeyAvailable()) {
+        char c = myKeyRead();
         if (c == 'x' || c == 'X' || c == 'l' || c == 'L') {
           myResetMenuState();
           return;
@@ -2032,8 +2441,8 @@ void myActionInfer() {
     myLkPoll();
     unsigned long frameStart = millis();
 
-    if (Serial.available()) {
-      char c = Serial.read();
+    if (myKeyAvailable()) {
+      char c = myKeyRead();
       if (myHandleDebugChar(c)) {
         // handled: the web page is asking for debug frames
       } else if (c == 't' || c == 'T' || c == 'l' || c == 'L') {
@@ -2138,7 +2547,7 @@ void myDrawMenu() {
     Serial.print(i == myMenuIndex ? " > " : "   ");
     Serial.printf("%d. %s\n", i, myMenuLabel(i).c_str());
   }
-  Serial.println("Keys: t = next (tap)   l = select (long press)   or press the item's number");
+  Serial.println("Keys (USB, or the page's remote buttons over WiFi): t = next (tap)   l = select (long press)   or the item's number");
 
   // ---- OLED menu: three rows, scrolled so the chosen item is always visible ----
   int myStartItem = myMenuIndex - 1;
@@ -2169,8 +2578,8 @@ void myHandleMenuNavigation() {
   unsigned long myCurrentMillis = millis();
 
   // ---- Serial keys ----
-  if (!myIsSelected && Serial.available()) {
-    char c = Serial.read();
+  if (!myIsSelected && myKeyAvailable()) {
+    char c = myKeyRead();
 
     if (myHandleDebugChar(c)) {
       // handled: the web page is asking for debug frames
