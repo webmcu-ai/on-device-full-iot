@@ -1,15 +1,19 @@
 // =============================================================================
-//  server-v001.js  -  classroom bridge for the webMCU-AI Vision trainer (index-v001.html)
-//  Run:   npm install ws      then      node server-v001.js
-//  Open:  http://localhost:8080          (this server hands out index-v001.html from the same folder)
+//  server-v004.js  -  classroom bridge for the webMCU-AI Vision trainer (index-v004.html)
+//  Run:   npm install ws      then      node server-v004.js
+//  Open:  http://localhost:8080          (this server hands out the newest index-vNNN.html from the same folder)
 //
 //  What it does, in two small jobs:
-//   1. Serves index-v001.html over plain http, so the page can use ws:// without the https block.
+//   1. Serves the newest index-vNNN.html over plain http, so the page can use ws:// without the https block.
 //   2. Bridges the page to boards:  ws://localhost:8080/dev/<board address>[:port]
 //      Type that address in section 9 of the page instead of the board's own address. Every message
 //      (text and binary) is passed through unchanged in both directions, so debug frames and weights
 //      pushes work exactly as if the page were talking to the board directly. Open several tabs, one
 //      per board, to watch a whole classroom at once.
+//      v004: the bridge itself is unchanged: camera pictures, file pieces and keys are ordinary text messages, so they pass
+//      through untouched. What changed: the page is now found by name pattern (index-v*.html, highest number), so a new page
+//      version no longer needs a new server. Bluetooth does not use this server at all (the browser talks to the board directly).
+//      server-v004.py is the same bridge in Python.
 //  Only private network addresses and .local names are allowed, so this is not an open proxy.
 //  MIT license. Use at your own risk. By Jeremy Ellis (webmcu-ai).
 // =============================================================================
@@ -20,8 +24,15 @@ const myOs = require('os');
 const MyWebSocket = require('ws');
 
 const myPort = Number(process.env.PORT) || 8080;
-const myPagePath = myPath.join(__dirname, 'index-v001.html');
-const myBoardPort = 81;                                    // the board's WebSocket port (firmware-v001)
+function myPageName() {                                    // newest index-vNNN.html in this folder
+  let myBest = '', myBestNum = -1;
+  for (const myFile of myFs.readdirSync(__dirname)) {
+    const myMatch = /^index-v(\d+)\.html$/.exec(myFile);
+    if (myMatch && Number(myMatch[1]) > myBestNum) { myBestNum = Number(myMatch[1]); myBest = myFile; }
+  }
+  return myBest;
+}
+const myBoardPort = 81;                                    // the board's WebSocket port (firmware-v004)
 const myAllowedHost = /^(localhost|[A-Za-z0-9-]+\.local|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|169\.254\.\d+\.\d+)$/;
 
 function myLanAddress() {
@@ -32,9 +43,10 @@ function myLanAddress() {
 
 const myServer = myHttp.createServer((myReq, myRes) => {
   const myUrl = myReq.url.split('?')[0];
-  if (myUrl === '/' || myUrl === '/index-v001.html') {
-    myFs.readFile(myPagePath, (myErr, myData) => {
-      if (myErr) { myRes.writeHead(500, { 'Content-Type': 'text/plain' }); myRes.end('index-v001.html must be in the same folder as server-v001.js'); return; }
+  const myName = myPageName();
+  if (myName && (myUrl === '/' || myUrl === '/' + myName)) {
+    myFs.readFile(myPath.join(__dirname, myName), (myErr, myData) => {
+      if (myErr) { myRes.writeHead(500, { 'Content-Type': 'text/plain' }); myRes.end('Could not read ' + myName); return; }
       myRes.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       myRes.end(myData);
     });
