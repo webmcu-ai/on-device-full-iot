@@ -1,13 +1,20 @@
 <!DOCTYPE html>
 <!--
-  webMCU-AI  |  Vision CNN SD trainer + device link  |  v001
-  Companion page for the XIAO ESP32-S3 "FULL VISION ML" firmware (firmware-v001; firmware-v005 and later send debug frames).
+  webMCU-AI  |  Vision CNN SD trainer + device link  |  v004
+  Companion page for the XIAO ESP32-S3 "FULL VISION ML" firmware (firmware-v004; firmware-v005 and later send debug frames).
+  v004: ONE DEVICE LINK. Sections 8 and 9 are now one: three connect buttons (USB serial, WiFi, Bluetooth) and one send box.
+        The same text commands work on all three. New buttons download and upload the model, config.json and images, so
+        collecting, training and deploying never needs the SD card to leave the board. Web Bluetooth is new (Chrome or Edge).
+  v003: THE BOARD IS A CAMERA TOO. Everything the computer webcam can do now also works with the board camera over USB serial
+        or WiFi: capture, burst, live preview and live inference. Remote keys (t, l, x, digits) drive the board menu over either
+        link. "Ask the board" copies the board layout and class names. "New empty project" needs no SD card at all.
+        Server helpers: server-v004.js (Node) or server-v004.py (Python). LoRa comes later.
   Reads images/<class>/*.jpg from the SD card, trains the same CNN (input size and filters selectable) in plain JS,
   analyzes the dataset, and writes header/myWeights.bin back for the device to load.
   v001: DEVICE LINK. The page now talks to the board over USB serial (section 8) OR WiFi WebSocket (section 9),
         shows the same device debug frames on both, and can SEND the trained weights to the board without moving the SD card.
         Everything from v006 is unchanged (SD folder and zip, review, burst capture, any input size, parity test).
-        Coming next: Web Bluetooth, LoRa network monitor, Node bridge (server-v001.js).
+        Coming next: LoRa.
   v006: input sizes 16..512 (preset list plus a number box), device memory and speed estimate for the chosen layout,
         decoded images are cached as bytes (4x less browser memory at large sizes).
   No external libraries. No network. MIT license. Use at your own risk.
@@ -16,7 +23,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vision CNN SD trainer + device link v001</title>
+<title>Vision CNN SD trainer + device link v004</title>
 <style>
 :root{--bg:#11151b;--panel:#182029;--panel2:#1f2a36;--line:#2c3947;--text:#dde5ee;--mut:#8b9aac;--acc:#66d1bd;--acc-ink:#062a24;--bad:#ef6b73;--warn:#e9b44c;--ok:#7bd88f;--r:8px}
 *{box-sizing:border-box}
@@ -92,6 +99,9 @@ button.burst.recording{background:var(--bad);color:#fff;border-color:var(--bad);
 .revframe.marked{border-color:var(--bad)}
 .revtag{display:none;position:absolute;top:8px;left:8px;background:var(--bad);color:#fff;padding:2px 8px;border-radius:4px;font-weight:600;font-size:13px}
 .revframe.marked .revtag{display:block}
+.vwrap canvas{display:none}
+.vwrap.board canvas{display:block}
+.vwrap.board video{display:none}
 .linkbar{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
 .badge{display:inline-flex;align-items:center;gap:6px;padding:3px 12px;border-radius:14px;border:1px solid var(--line);background:#0f1319;font-size:13px}
 .badge i{width:9px;height:9px;border-radius:50%;background:var(--mut)}
@@ -101,8 +111,8 @@ button.burst.recording{background:var(--bad);color:#fff;border-color:var(--bad);
 </head>
 <body>
 <header>
-  <h1>Vision CNN SD trainer<span class="ver">v001 &middot; USB + WiFi link</span></h1>
-  <p>Browser companion for the XIAO ESP32-S3 FULL VISION ML firmware (firmware-v001; firmware-v005 and later also give config.json class names and debug frames): load the SD card, add images, review and clean them, train the same CNN, then write myWeights.bin back to the card.</p>
+  <h1>Vision CNN SD trainer<span class="ver">v004 &middot; USB + WiFi + Bluetooth link</span></h1>
+  <p>Browser companion for the XIAO ESP32-S3 FULL VISION ML firmware (firmware-v004; firmware-v005 and later also give config.json class names and debug frames): load the SD card, add images, review and clean them, train the same CNN, then write myWeights.bin back to the card.</p>
   <p>Everything runs in this page. Images and weights never leave your computer.</p>
 </header>
 <main>
@@ -113,6 +123,7 @@ button.burst.recording{background:var(--bad);color:#fff;border-color:var(--bad);
   <div class="row">
     <button id="btnDir" class="primary">Pick SD card folder</button>
     <button id="btnZip">Load .zip</button>
+    <button id="myBtnEmpty" onclick="myNewEmpty()">New empty project (no SD card)</button>
     <input type="file" id="zipFile" accept=".zip,application/zip" hidden>
   </div>
   <p class="note" id="dirNote"></p>
@@ -130,11 +141,19 @@ button.burst.recording{background:var(--bad);color:#fff;border-color:var(--bad);
   <p class="note">The sketch must be compiled with these values (the firmware refuses a weights file of the wrong size). The firmware also reads the class names from header/config.json at boot, but their count must equal NUM_CLASSES, so adding or removing a class means editing NUM_CLASSES and reflashing:</p>
   <pre id="fwLines">(no classes yet)</pre>
 
-  <h3>Add images from the webcam</h3>
+  <h3>Add images from a camera</h3>
   <div class="cam">
-    <div class="vwrap" id="capWrap"><video id="capVideo" class="mir" playsinline muted></video><span id="rec" class="rec">● REC</span></div>
+    <div class="vwrap" id="capWrap"><video id="capVideo" class="mir" playsinline muted></video><span id="rec" class="rec">● REC</span><canvas id="myBoardCanvas" width="240" height="240"></canvas></div>
     <div style="flex:1;min-width:230px">
-      <div class="row"><button id="btnCam">Start camera</button></div>
+      <div class="row">
+        <select id="myCamSource" onchange="myCamSourceChange()" aria-label="Camera to use">
+          <option value="web">Camera: this computer's webcam</option>
+          <option value="board">Camera: the board (USB or WiFi link)</option>
+        </select>
+        <button id="btnCam">Start camera</button>
+        <button id="myBoardPreviewBtn" onclick="myBoardPreviewToggle()">Board preview</button>
+      </div>
+      <p class="note" id="myCamNote">The webcam needs Start camera. The board camera needs a link: USB serial, WiFi or Bluetooth (section 8). Board pictures are saved exactly as the board made them (already flipped like its own images), so the Mirror box below only changes webcam frames.</p>
       <div class="row">
         <select id="capClass" aria-label="Class to capture into"></select>
         <button id="btnCapture" class="primary">Capture (Space)</button>
@@ -296,20 +315,50 @@ button.burst.recording{background:var(--bad);color:#fff;border-color:var(--bad);
   <textarea id="console" readonly aria-label="Console log"></textarea>
 </section>
 
-<!-- ============ 8 SERIAL MONITOR ============ -->
+<!-- ============ 8 DEVICE LINK ============ -->
 <section id="s-serial">
-  <h2>8 Serial monitor</h2>
+  <h2>8 Device link: USB serial, WiFi or Bluetooth</h2>
+  <p class="note">Connect one way at a time. All three links speak the same text commands, so the board camera (section 2), the send box, and the model, config.json and image buttons work on whichever one is open.</p>
+  <div class="linkbar"><span class="badge" id="lkBadgeUsb"><i></i>USB serial</span><span class="badge" id="lkBadgeWifi"><i></i>WiFi</span><span class="badge" id="lkBadgeBle"><i></i>Bluetooth</span></div>
   <div class="row">
-    <button id="btnSerial" class="primary">Connect</button>
-    <span class="note" id="serStatus">Not connected.</span>
-    <label class="chk"><input type="checkbox" id="serDebug" checked> Ask the device for debug frames (firmware-v005 or later)</label>
+    <button id="btnSerial" class="primary">Connect USB serial</button>
+    <button id="lkConnect" class="primary">Connect WiFi</button>
+    <button id="myBleBtn" class="primary" onclick="myBleConnect()">Connect Bluetooth</button>
+    <input type="text" id="lkHost" value="ws://localhost:8080/dev/192.168.4.1" aria-label="Board address for WiFi" style="min-width:300px">
   </div>
-  <textarea id="serOut" class="mono" readonly aria-label="Serial output"></textarea>
+  <p class="note" id="serStatus">USB serial not connected.</p>
+  <div class="info" id="lkStatus">Nothing connected yet.</div>
+  <label class="chk"><input type="checkbox" id="serDebug" checked> Ask the device for debug frames (firmware-v005 or later; leave off for Bluetooth, it is slow)</label>
+  <textarea id="serOut" class="mono" readonly aria-label="Device output"></textarea>
   <div class="row">
-    <input type="text" id="serIn" placeholder="Text to send, e.g. t, l or 1" aria-label="Text to send" disabled style="flex:1;min-width:200px">
-    <button id="serSend" disabled>Send</button>
+    <input type="text" id="serIn" placeholder="Command, e.g. t, l, 1, @info, @ls /images" aria-label="Command to send" style="flex:1;min-width:200px">
+    <button id="serSend">Send</button>
   </div>
-  <p class="note">115200 baud, a newline is added to what you send. Close the Arduino IDE serial monitor first. Opening the port can reboot the board, and a reboot may drop the connection: press Connect again. Desktop Chrome or Edge only.</p>
+  <details><summary>Commands you can type</summary>
+<pre>t          next item / capture a picture
+l          select / exit
+x          stop training
+1 .. 9     jump to a menu item
+@info      layout, class names, SD card and weights
+@snap      one camera picture
+@ls /images                     list the class folders (add /&lt;class&gt; for the files)
+@stat /header/myWeights.bin     size of a file</pre></details>
+  <h3>Model, config.json and images</h3>
+  <div class="row">
+    <button id="lkPush" class="primary">Upload model to the board</button>
+    <button onclick="myDownloadModel()">Download model from the board</button>
+  </div>
+  <div class="row">
+    <button onclick="mySendConfig()">Upload config.json</button>
+    <button onclick="myDownloadConfig()">Download config.json</button>
+  </div>
+  <div class="row">
+    <button onclick="myUploadImages()">Upload images to the board</button>
+    <button onclick="myDownloadImages()">Download images from the board</button>
+    <button class="danger" onclick="myStopTransfer = true">Stop</button>
+  </div>
+  <div class="info" id="myInfoBox">Not asked yet. After a WiFi or Bluetooth connect the page compares the board's layout and class names with this page; with USB type @info.</div>
+  <p class="note">USB: 115200 baud, a newline is added to what you send. Close the Arduino IDE serial monitor first; opening the port can reboot the board. WiFi: the board joins your router or makes its own network "XIAO-Vision" (password xiaovision); keep the address above and run <code>node server-v004.js</code> or <code>python server-v004.py</code> on your computer, or type the board's address. Bluetooth: desktop Chrome or Edge (or Chrome on Android), board firmware with MY_USE_BLE 1. Models and many images take much longer over Bluetooth.</p>
   <h3>Device view</h3>
   <p class="note">With the box ticked, the firmware sends its camera JPEG (and a heatmap) every 10th inference, each saved image, and a slow live preview while collecting. Frame lines are shown here instead of in the monitor text. With a model in memory that has the same layout, the page runs the same JPEG through its own copy of the network and compares.</p>
   <div class="row"><label class="chk"><input type="checkbox" class="heatOverlay" checked> Overlay device heatmap on image</label></div>
@@ -317,19 +366,6 @@ button.burst.recording{background:var(--bad);color:#fff;border-color:var(--bad);
     <canvas id="devCanvas" width="288" height="288"></canvas>
     <div style="flex:1;min-width:230px"><div class="info" id="devInfo">No debug frame yet. Connect, keep the box ticked, then run Infer or a collect mode on the device.</div><div id="devBars"></div></div>
   </div>
-</section>
-
-<!-- ============ 9 WIFI LINK ============ -->
-<section id="s-link">
-  <h2>9 WiFi link and weights push</h2>
-  <div class="linkbar"><span class="badge" id="lkBadgeUsb"><i></i>USB serial</span><span class="badge" id="lkBadgeWifi"><i></i>WiFi</span></div>
-  <div class="row">
-    <input type="text" id="lkHost" value="ws://localhost:8080/dev/192.168.4.1" aria-label="Device address" style="min-width:340px">
-    <button id="lkConnect" class="primary">Connect WiFi</button>
-    <button id="lkPush">Send weights to device</button>
-  </div>
-  <div class="info" id="lkStatus">WiFi not connected. Sending weights also works over the USB serial connection of section 8.</div>
-  <p class="note">The board joins your router (name and password at the top of the firmware) or makes its own network "XIAO-Vision" (password xiaovision): join it, then leave the address as it is: the page talks to the small Node bridge on your computer (<code>node server-v001.js</code>), and the bridge talks to 192.168.4.1. On your home router, replace 192.168.4.1 with the board's address or xiao-vision.local. Over WiFi the device view in section 8 shows the same debug frames as over USB. <b>Send weights</b> sends the model in memory to the board, which loads it at once and keeps a copy on its SD card, so no card swap is needed. The layout must match the firmware (the board refuses a wrong size and says why). Browsers block <code>ws://</code> from https pages, so open this page from a local file or http://localhost.</p>
 </section>
 
 </main>
@@ -382,7 +418,7 @@ button.burst.recording{background:var(--bad);color:#fff;border-color:var(--bad);
 
 <script>
 'use strict';
-const VERSION = 'v001';
+const VERSION = 'v004';
 
 /* ==CORE START== (no DOM use below this line until CORE END) */
 
@@ -1023,13 +1059,77 @@ function grabFrame() {
   cctx.restore();
   return true;
 }
-const frameBlob = () => new Promise(r => capCanvas.toBlob(r, 'image/jpeg', 0.85));
+const frameBlob = () => (myCamSource === 'board' && myLastBoardBlob) ? Promise.resolve(myLastBoardBlob) : new Promise(r => capCanvas.toBlob(r, 'image/jpeg', 0.85));
+
+// ---------- camera source: the computer webcam or the board camera (v003) ----------
+let myCamSource = 'web';            // 'web' or 'board'
+let myLastBoardBlob = null;         // the newest picture from the board, exactly as the board made it
+let myBoardWaiter = null;           // waits for the next "@J" line from the board
+let myBoardChain = Promise.resolve();   // one picture request at a time
+let myBoardPreviewOn = false;
+
+function myCamSourceChange() {
+  myCamSource = $('myCamSource').value;
+  $('capWrap').classList.toggle('board', myCamSource === 'board');
+  $('btnCam').style.display = myCamSource === 'web' ? '' : 'none';
+  $('myBoardPreviewBtn').style.display = myCamSource === 'board' ? '' : 'none';
+  if (myCamSource === 'web') myBoardPreviewOn = false;
+  state.live = false; $('btnLive').textContent = 'Start live';
+  log('Camera source: ' + (myCamSource === 'board' ? 'the board (needs a USB or WiFi link)' : 'this computer webcam') + '.');
+}
+// True when the chosen camera can give a picture right now.
+function myCamReady() { return myCamSource === 'board' ? !!lkPick() : !!state.stream; }
+// Puts the newest picture in capCanvas. Webcam: instant. Board: asks with @snap and waits for the "@J" line.
+async function myGrab() {
+  if (myCamSource === 'web') return !!state.stream && grabFrame();
+  const r = myBoardChain.then(myBoardGrabOnce);
+  myBoardChain = r.catch(() => {});
+  return r;
+}
+async function myBoardGrabOnce() {
+  const l = lkPick();
+  if (!l) { log('Board camera: open the USB serial, WiFi or Bluetooth (section 8) link first.'); return false; }
+  const myWait = new Promise((res, rej) => {
+    const t = setTimeout(() => { myBoardWaiter = null; rej(new Error('no picture from the board within 4 seconds')); }, 4000);
+    myBoardWaiter = { res, t };
+  });
+  myWait.catch(() => {});
+  try {
+    await l.text('@snap');
+    const bytes = await myWait;
+    const myBlob = new Blob([bytes], { type: 'image/jpeg' }), myUrl = URL.createObjectURL(myBlob);
+    try {
+      const img = await loadImg(myUrl);
+      cctx.clearRect(0, 0, SRC, SRC); cctx.drawImage(img, 0, 0, SRC, SRC);
+    } finally { URL.revokeObjectURL(myUrl); }
+    myLastBoardBlob = myBlob;
+    $('myBoardCanvas').getContext('2d').drawImage(capCanvas, 0, 0);
+    return true;
+  } catch (e) { log('Board camera: ' + e.message); return false; }
+}
+// Called for each "@J <n> <base64>" line from the board.
+function myBoardFrameLine(line) {
+  const f = line.split(' ');
+  if (!myBoardWaiter || f.length < 3) return;
+  const w = myBoardWaiter; myBoardWaiter = null; clearTimeout(w.t);
+  try { w.res(b64ToBytes(f[2])); } catch (e) { /* the timeout reports it */ }
+}
+async function myBoardPreviewToggle() {
+  if (myBoardPreviewOn) { myBoardPreviewOn = false; $('myBoardPreviewBtn').textContent = 'Board preview'; return; }
+  if (!lkPick()) { log('Board camera: open the USB serial, WiFi or Bluetooth (section 8) link first.'); return; }
+  myBoardPreviewOn = true; $('myBoardPreviewBtn').textContent = 'Stop preview';
+  while (myBoardPreviewOn && myCamSource === 'board') {
+    if (!(await myGrab())) break;
+    await sleep(120);
+  }
+  myBoardPreviewOn = false; $('myBoardPreviewBtn').textContent = 'Board preview';
+}
 
 async function capture() {
   if (!state.mode) { log('Load a data source first (section 1).'); return; }
   const ci = parseInt($('capClass').value);
   if (!state.classes[ci]) { log('Add or pick a class first.'); return; }
-  if (!state.stream || !grabFrame()) { log('Start the camera first.'); return; }
+  if (!(await myGrab())) { log(myCamSource === 'board' ? 'The board camera gave no picture. Check the link in section 8.' : 'Start the camera first.'); return; }
   const blob = await frameBlob(), name = 'img_' + Date.now() + '.jpg';
   if (state.mode === 'dir') { try { await writeFile(await classDir(ci, true), name, blob); } catch (e) { log('Write to the SD folder failed: ' + e.message); return; } }
   addSample(ci, name, blob); state.evalStale = true;
@@ -1266,7 +1366,8 @@ function renderEval() {
 async function toggleLive() {
   if (state.live) { state.live = false; $('btnLive').textContent = 'Start live'; return; }
   if (!hasModel()) { log('Live: no model in memory. Train, or load a folder with header/myWeights.bin first.'); $('liveBanner').textContent = 'No model yet'; return; }
-  await startCam(); if (!state.stream) return;
+  if (myCamSource === 'web') { await startCam(); if (!state.stream) return; }
+  else if (!lkPick()) { log('Live: open a USB or WiFi link to the board first.'); return; }
   state.live = true; $('btnLive').textContent = 'Stop live'; liveLoop();
 }
 async function liveLoop() {
@@ -1274,7 +1375,7 @@ async function liveLoop() {
   while (state.live) {
     try {
       if (!hasModel()) { state.live = false; $('btnLive').textContent = 'Start live'; break; }
-      if (grabFrame()) {
+      if (await myGrab()) {
         const blob = await frameBlob(), x = rgbaToInput(await decodeBlob(blob)); forward(state.net, x);
         const p = state.net.a.probs, top = argmax(p);
         $('liveBanner').textContent = state.classes[top] + '  ' + (p[top] * 100).toFixed(0) + '%';
@@ -1288,7 +1389,7 @@ async function liveLoop() {
 }
 
 // ---------- save ----------
-const configJson = () => JSON.stringify({ page: 'vision-cnn-sd-trainer ' + VERSION, firmware: 'FULL VISION ML firmware-v001', input_size: IN, input_channels: 3, conv1_filters: C1F, conv2_filters: C2F, kernel_size: 3, classes: state.classes, weights_file: 'header/myWeights.bin', weights_floats: totalFloats(state.classes.length), note: 'Class names are read by this page and by the firmware at boot. NUM_CLASSES, INPUT_SIZE and filter counts are compile-time in the sketch.' }, null, 2);
+const configJson = () => JSON.stringify({ page: 'vision-cnn-sd-trainer ' + VERSION, firmware: 'FULL VISION ML firmware-v004', input_size: IN, input_channels: 3, conv1_filters: C1F, conv2_filters: C2F, kernel_size: 3, classes: state.classes, weights_file: 'header/myWeights.bin', weights_floats: totalFloats(state.classes.length), note: 'Class names are read by this page and by the firmware at boot. NUM_CLASSES, INPUT_SIZE and filter counts are compile-time in the sketch.' }, null, 2);
 
 async function saveWeights() {
   const st = $('saveStatus');
@@ -1362,7 +1463,7 @@ async function burst() {
   if (!state.mode) { log('Load a data source first (section 1).'); return; }
   const ci = parseInt($('capClass').value);
   if (!state.classes[ci]) { log('Add or pick a class first.'); return; }
-  if (!state.stream) { log('Start the camera first.'); return; }
+  if (!myCamReady()) { log(myCamSource === 'board' ? 'Open a USB or WiFi link to the board first.' : 'Start the camera first.'); return; }
   let dir = null;
   if (state.mode === 'dir') { try { dir = await classDir(ci, true); } catch (e) { log('Cannot open the class folder: ' + e.message); return; } }
   bursting = true;
@@ -1372,8 +1473,8 @@ async function burst() {
   try {
     for (let i = 0; i < BURST_N; i++) {
       btn.textContent = '\u25CF ' + (i + 1) + '/' + BURST_N;
-      await nextVideoFrame();
-      if (!grabFrame()) break;
+      if (myCamSource === 'web') await nextVideoFrame();
+      if (!(await myGrab())) break;
       wrap.classList.add('flash'); setTimeout(() => wrap.classList.remove('flash'), 60);
       let name = 'img_' + Date.now() + '.jpg'; if (name === last) name = 'img_' + (Date.now() + 1) + '.jpg'; last = name;
       got.push({ name, blob: await frameBlob() });
@@ -1472,9 +1573,8 @@ function serAppend(t) {
   o.scrollTop = o.scrollHeight;
 }
 function serUi(on) {
-  $('btnSerial').textContent = on ? 'Disconnect' : 'Connect';
-  $('serSend').disabled = !on; $('serIn').disabled = !on;
-  $('serStatus').textContent = on ? 'Connected at 115200 baud.' : 'Not connected.';
+  $('btnSerial').textContent = on ? 'Disconnect USB serial' : 'Connect USB serial';
+  $('serStatus').textContent = on ? 'USB serial connected at 115200 baud.' : 'USB serial not connected.';
 }
 async function serDisconnect() {
   const p = ser.port; if (!p) return; ser.port = null;
@@ -1500,16 +1600,17 @@ async function serConnect() {
   (async () => { try { for (;;) { const { value, done } = await rd.read(); if (done) break; if (value) serFeed(value); } } catch (e) { /* closed */ } if (ser.port === port) serDisconnect(); })();
 }
 async function serSend() {
-  if (!ser.writer) return;
-  const t = $('serIn').value;
-  try { await ser.writer.write(t + '\n'); serAppend('> ' + t + '\n'); } catch (e) { log('Serial send failed: ' + e.message); }
+  const t = $('serIn').value, l = lkPick();
+  if (!t) return;
+  if (!l) { lkSay('Connect USB serial, WiFi or Bluetooth in section 8 first.', 'warn'); return; }
+  try { await l.text(t); serAppend('> ' + t + '\n'); } catch (e) { log('Send failed: ' + e.message); }
   $('serIn').value = ''; $('serIn').focus();
 }
 
 // ---------- device debug frames (firmware-v005 or later) ----------
 let serPend = '', serBeat = null;
 const dev = { f: null, tok: 0 };
-function serDebugSync() { const c = $('serDebug').checked ? 'D' : 'd'; if (ser.writer) ser.writer.write(c).catch(() => {}); lkSendText(c); }   // heartbeat on every open link
+function serDebugSync() { const c = $('serDebug').checked ? 'D' : 'd'; if (ser.writer) ser.writer.write(c).catch(() => {}); lkSendText(c); if (myBle.rx) myBleWrite(c + '\n').catch(() => {}); }   // heartbeat on every open link
 const b64ToBytes = s => { const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; };
 // Text goes to the monitor; complete lines that start with '@' are debug frames.
 function serFeed(chunk) {
@@ -1570,13 +1671,16 @@ async function renderDev() {
 const lk = { ws: null, waiter: null, fin: null, beat: null };
 const lkSay = (m, cls) => { const s = $('lkStatus'); s.textContent = m; s.className = 'info ' + (cls || ''); };
 function lkBadges() {
-  const usb = !!(ser.port && ser.writer), wifi = !!(lk.ws && lk.ws.readyState === 1);
-  $('lkBadgeUsb').classList.toggle('on', usb); $('lkBadgeWifi').classList.toggle('on', wifi);
+  const usb = !!(ser.port && ser.writer), wifi = !!(lk.ws && lk.ws.readyState === 1), ble = !!myBle.rx;
+  $('lkBadgeUsb').classList.toggle('on', usb); $('lkBadgeWifi').classList.toggle('on', wifi); $('lkBadgeBle').classList.toggle('on', ble);
   $('lkConnect').textContent = lk.ws ? 'Disconnect WiFi' : 'Connect WiFi';
 }
 // One incoming line, from USB or WiFi: replies, debug frames, or plain text for the monitor.
 function lkLine(line) {
   if (/^[AEY],/.test(line)) { lkSettle(line.trim()); return; }
+  if (line.startsWith('@J ')) { myBoardFrameLine(line.trim()); return; }
+  if (line.startsWith('@L ')) { myListLine(line.trim()); return; }
+  if (line.startsWith('@D ')) { myDataLine(line.trim()); return; }
   if (line.charCodeAt(0) === 64) serFrame(line.trim()); else serAppend(line.replace(/\r$/, '') + '\n');
 }
 function lkSettle(line) {
@@ -1602,21 +1706,22 @@ function lkConnect() {
   let ws;
   try { ws = new WebSocket(url); } catch (e) { lkSay('Could not start: ' + e.message, 'bad'); return; }
   ws.binaryType = 'arraybuffer'; lk.ws = ws; lkBadges();
-  ws.onopen = () => { lkSay('WiFi connected to ' + url, 'ok'); log('WiFi link open: ' + url); lkBadges(); serDebugSync(); lk.beat = setInterval(serDebugSync, 5000); };
+  ws.onopen = () => { lkSay('WiFi connected to ' + url, 'ok'); log('WiFi link open: ' + url); lkBadges(); serDebugSync(); lk.beat = setInterval(serDebugSync, 5000); setTimeout(() => myBoardInfo(false), 800); };
   ws.onmessage = e => { if (typeof e.data === 'string') e.data.split('\n').forEach(l => { if (l) lkLine(l); }); };
-  ws.onerror = () => lkSay('WiFi connection failed. Same network as the board? Is firmware-v001 running (Serial monitor shows the address)?', 'bad');
+  ws.onerror = () => lkSay('WiFi connection failed. Same network as the board? Is firmware-v004 running (Serial monitor shows the address)?', 'bad');
   ws.onclose = () => { if (lk.ws === ws) lk.ws = null; clearInterval(lk.beat); lk.beat = null; lkBadges(); log('WiFi link closed.'); };
 }
 // Whichever link is open: WiFi first (binary frames, fast), else USB (hex text lines, slow but works anywhere).
 function lkPick() {
   if (lk.ws && lk.ws.readyState === 1) return { kind: 'WiFi', step: 4096, text: s => lk.ws.send(s), bin: b => lk.ws.send(b) };
   if (ser.port && ser.writer) return { kind: 'USB', step: 96, text: s => ser.writer.write(s + '\n') };
+  if (myBle.rx) return { kind: 'BLE', step: 96, text: s => myBleWrite(s + '\n') };
   return null;
 }
 async function lkPush() {
   if (!hasModel()) { lkSay('No model in memory. Train, or load weights, first.', 'warn'); return; }
   const l = lkPick();
-  if (!l) { lkSay('Connect WiFi above, or the USB serial monitor in section 8, first.', 'warn'); return; }
+  if (!l) { lkSay('Connect USB serial, WiFi or Bluetooth in section 8 first.', 'warn'); return; }
   const bytes = new Uint8Array(serializeWeights(state.net));
   let sum = 0; for (let i = 0; i < bytes.length; i++) sum = (sum + bytes[i]) >>> 0;
   $('lkPush').disabled = true; lk.fin = null;
@@ -1644,6 +1749,206 @@ async function lkPush() {
   } catch (e) { lkSay('Send failed: ' + e.message, 'bad'); log('Weights send failed: ' + e.message); }
   $('lkPush').disabled = false;
 }
+// ---------- Bluetooth link (Web Bluetooth) ----------
+const myBleSvcId = '7a1b0001-5d7c-4f6e-9a3e-0f2c4b1d8e01', myBleRxId = '7a1b0002-5d7c-4f6e-9a3e-0f2c4b1d8e01', myBleTxId = '7a1b0003-5d7c-4f6e-9a3e-0f2c4b1d8e01';
+const myBle = { dev: null, rx: null, tx: null, beat: null, dec: new TextDecoder() };
+let myBleChain = Promise.resolve();
+async function myBleConnect() {
+  if (myBle.dev) { myBle.dev.gatt.disconnect(); return; }
+  if (!navigator.bluetooth) { lkSay('Web Bluetooth is not available in this browser. Use desktop Chrome or Edge, or Chrome on Android.', 'bad'); return; }
+  try {
+    lkSay('Pick the board in the Bluetooth window ...');
+    const myDev = await navigator.bluetooth.requestDevice({ filters: [{ services: [myBleSvcId] }] });
+    myDev.addEventListener('gattserverdisconnected', myBleGone);
+    const myServer = await myDev.gatt.connect(), mySvc = await myServer.getPrimaryService(myBleSvcId);
+    myBle.rx = await mySvc.getCharacteristic(myBleRxId); myBle.tx = await mySvc.getCharacteristic(myBleTxId);
+    myBle.tx.addEventListener('characteristicvaluechanged', e => serFeed(myBle.dec.decode(e.target.value, { stream: true })));
+    await myBle.tx.startNotifications();
+    myBle.dev = myDev; $('serDebug').checked = false;
+    $('myBleBtn').textContent = 'Disconnect Bluetooth';
+    lkSay('Bluetooth connected to ' + (myDev.name || 'the board') + '. Debug frames are off (slow over Bluetooth); tick the box to turn them on.', 'ok'); log('Bluetooth link open.');
+    myBle.beat = setInterval(serDebugSync, 5000); lkBadges(); setTimeout(() => myBoardInfo(false), 800);
+  } catch (e) { if (e.name !== 'NotFoundError') lkSay('Bluetooth: ' + e.message, 'bad'); myBleGone(); }
+}
+function myBleGone() {
+  const was = !!myBle.dev; clearInterval(myBle.beat); myBle.beat = null; myBle.dev = myBle.rx = myBle.tx = null;
+  $('myBleBtn').textContent = 'Connect Bluetooth'; lkBadges(); if (was) log('Bluetooth link closed.');
+}
+// Writes go out one after another, in pieces of at most 240 bytes.
+function myBleWrite(myText) {
+  const myBytes = new TextEncoder().encode(myText);
+  const r = myBleChain.then(async () => { for (let o = 0; o < myBytes.length; o += 240) await myBle.rx.writeValueWithResponse(myBytes.subarray(o, o + 240)); });
+  myBleChain = r.catch(() => {});
+  return r;
+}
+
+// ---------- asking the board, and files on the board (same on USB, WiFi and Bluetooth) ----------
+let myStopTransfer = false, myListRows = null, myDataWaiter = null;
+async function myAsk(myCmd, myMs) {
+  const l = lkPick(); if (!l) throw new Error('open USB serial, WiFi or Bluetooth in section 8 first');
+  const p = lkWait(myMs || 4000); p.catch(() => {}); await l.text(myCmd); return p;
+}
+function myListLine(line) { if (!myListRows) return; const i = line.indexOf(' ', 3); myListRows.push({ size: parseInt(line.slice(3, i)), name: line.slice(i + 1) }); }
+function myDataLine(line) {
+  const f = line.split(' '); if (!myDataWaiter || f.length < 4) return;
+  const w = myDataWaiter; myDataWaiter = null; clearTimeout(w.t);
+  try { w.res({ offset: +f[1], sum: +f[2], bytes: b64ToBytes(f[3]) }); } catch (e) { /* the timeout reports it */ }
+}
+// Folder listing: rows of { size, name }, size -1 means a folder.
+async function myListRemote(myPath) {
+  myListRows = [];
+  try { await myAsk('@ls ' + myPath, 20000); return myListRows.slice(); } finally { myListRows = null; }
+}
+// Reads a whole file from the board, piece by piece, checking every piece.
+async function myReadRemote(myPath, myProgress) {
+  const myTotal = parseInt((await myAsk('@stat ' + myPath)).val.split('|')[1]);
+  if (!(myTotal >= 0)) throw new Error('could not get the size of ' + myPath);
+  const l = lkPick(), myStep = l.kind === 'BLE' ? 600 : 1536, myOut = new Uint8Array(myTotal);
+  let myOff = 0, myBad = 0;
+  while (myOff < myTotal) {
+    const n = Math.min(myStep, myTotal - myOff);
+    const w = new Promise((res, rej) => { const t = setTimeout(() => { myDataWaiter = null; rej(new Error('timed out')); }, 5000); myDataWaiter = { res, t }; });
+    w.catch(() => {});
+    try {
+      await l.text('@read ' + myOff + ' ' + n + ' ' + myPath);
+      const d = await w; let sum = 0; for (const x of d.bytes) sum += x;
+      if (d.offset !== myOff || d.bytes.length !== n || sum !== d.sum) throw new Error('piece did not check out');
+      myOut.set(d.bytes, myOff); myOff += n; myBad = 0; if (myProgress) myProgress(myOff, myTotal);
+    } catch (e) { if (++myBad > 5) throw new Error('reading ' + myPath + ' failed at byte ' + myOff + ': ' + e.message); }
+  }
+  return myOut;
+}
+// Writes one image to the board (/images/<class>/<file>), piece by piece.
+async function myPutRemote(myPath, myBytes) {
+  const l = lkPick(); if (!l) throw new Error('the link closed');
+  let myAll = 0; for (const x of myBytes) myAll += x;
+  lk.fin = null; await myAsk('@put ' + myBytes.length + ' ' + myAll + ' ' + myPath);
+  const myStep = l.kind === 'BLE' ? 450 : 1200; let myOff = 0, myBad = 0;
+  while (myOff < myBytes.length) {
+    const myEnd = Math.min(myOff + myStep, myBytes.length); let myBin = '', mySum = 0;
+    for (let i = myOff; i < myEnd; i++) { myBin += String.fromCharCode(myBytes[i]); mySum += myBytes[i]; }
+    const p = lkWait(5000); p.catch(() => {});
+    try {
+      await l.text('@w' + myOff + ',' + mySum + ',' + btoa(myBin));
+      const got = Number((await p).val);
+      if (got === myEnd) { myOff = myEnd; myBad = 0; } else { if (got >= 0 && got < myBytes.length) myOff = got; if (++myBad > 8) throw new Error('the board keeps refusing at byte ' + myOff); }
+    } catch (e) { if (!/timed out/.test(e.message) || ++myBad > 8) throw e; }
+  }
+  for (let i = 0; i < 100 && !lk.fin; i++) await sleep(50);
+  if (!lk.fin) throw new Error('no confirmation from the board');
+  if (lk.fin.tag === 'E') throw new Error(lk.fin.val);
+}
+
+// Copies layout and class names into this page (used by Ask the board, Download config.json and Download images).
+async function myApplySetup(myNames, mySize, myC1, myC2) {
+  if (!layoutValid(mySize, myC1, myC2)) { log('The board layout is not valid on this page.'); return false; }
+  if (!state.mode) await myNewEmpty();
+  const same = myNames.length === state.classes.length && myNames.every((n, i) => n === state.classes[i]);
+  if (!same) {
+    if (state.mode === 'dir' && state.classes.length) { log('This SD folder already has other classes, so they are not replaced.'); return false; }
+    if ((state.samples.length || state.dirty) && !confirm('Replace this page\'s classes and images with the board\'s class names? Unsaved images and the model in memory are discarded.')) return false;
+    for (const sm of state.samples) URL.revokeObjectURL(sm.url);
+    state.samples = []; state.classes = myNames.slice(); resetModel();
+    if (state.mode === 'dir') { try { for (let i = 0; i < state.classes.length; i++) await classDir(i, true); } catch (e) { log('Could not create the class folders: ' + e.message); } }
+  }
+  if (mySize + 'x' + myC1 + 'x' + myC2 !== layoutKey()) { setLayout(mySize, myC1, myC2); state.samples.forEach(sm => sm.px = null); resetModel(); syncLayoutControls(); }
+  renderAll(); log('Copied the board layout ' + mySize + 'x' + myC1 + 'x' + myC2 + ' and its ' + myNames.length + ' class names.');
+  return true;
+}
+// @info: compares the board with this page. With adopt true it copies the board's layout and classes first.
+async function myBoardInfo(adopt) {
+  const box = $('myInfoBox'); let r;
+  try { r = await myAsk('@info'); }
+  catch (e) { box.innerHTML = '<span class="bad">The board did not answer: ' + esc(e.message) + ' (needs firmware-v004).</span>'; return; }
+  const f = r.val.split('|');                 // info|v004|64|4|8|a,b,c|sd=1|w=1
+  if (f[0] !== 'info' || f.length < 8) { box.textContent = 'Unexpected answer: ' + r.val; return; }
+  const b = { size: +f[2], c1: +f[3], c2: +f[4], names: f[5] ? f[5].split(',') : [], sd: f[6] === 'sd=1', w: f[7] === 'w=1' };
+  if (adopt) await myApplySetup(b.names, b.size, b.c1, b.c2);
+  const nowLayout = b.size + 'x' + b.c1 + 'x' + b.c2 === layoutKey();
+  const nowNames = b.names.length === state.classes.length && b.names.every((n, i) => n === state.classes[i]);
+  box.innerHTML = '<div>Board: layout <b>' + b.size + 'x' + b.c1 + 'x' + b.c2 + '</b>, ' + b.names.length + ' classes (' + esc(b.names.join(', ')) + '), SD card ' + (b.sd ? 'ok' : 'missing') + ', weights ' + (b.w ? 'in memory' : 'none') + '.</div>' +
+    '<div class="' + (nowLayout ? 'ok' : 'bad') + '">Layout ' + (nowLayout ? 'matches this page.' : 'differs from this page (' + layoutKey() + '). Download config.json to copy the board\'s, or change the sketch and reflash.') + '</div>' +
+    '<div class="' + (nowNames ? 'ok' : 'warn') + '">Class names ' + (nowNames ? 'match this page.' : 'differ from this page. Download config.json to copy the board\'s, or Upload config.json to send this page\'s (same count needed).') + '</div>';
+}
+async function mySendConfig() {
+  if (!state.classes.length) { lkSay('No classes to send.', 'warn'); return; }
+  try {
+    const r = await myAsk('@cfg ' + JSON.stringify(JSON.parse(configJson())), 5000);
+    lkSay('Board: ' + r.val, 'ok'); log('Board: ' + r.val); await myBoardInfo(false);
+  } catch (e) { lkSay('Upload config.json failed: ' + e.message, 'bad'); }
+}
+async function myDownloadConfig() {
+  try {
+    const myBytes = await myReadRemote('/header/config.json', (a, t) => lkSay('Downloading config.json ... ' + a + ' of ' + t + ' bytes'));
+    const myCfg = JSON.parse(new TextDecoder().decode(myBytes));
+    if (!Array.isArray(myCfg.classes)) throw new Error('config.json has no classes list');
+    const ok = await myApplySetup(myCfg.classes.filter(c => typeof c === 'string'), myCfg.input_size || IN, myCfg.conv1_filters || C1F, myCfg.conv2_filters || C2F);
+    lkSay(ok ? 'config.json copied: ' + state.classes.join(', ') : 'config.json downloaded, nothing changed.', ok ? 'ok' : 'warn');
+  } catch (e) { lkSay('Download config.json failed: ' + e.message + ' (no config.json on the board yet? Type @info, or Upload config.json first.)', 'bad'); }
+}
+async function myDownloadModel() {
+  try {
+    if (!state.classes.length) await myBoardInfo(true);
+    if (!state.classes.length) { lkSay('This page needs the class names first. Try Download config.json.', 'warn'); return; }
+    const myBytes = await myReadRemote('/header/myWeights.bin', (a, t) => lkSay('Downloading the model ... ' + Math.round(100 * a / t) + '%'));
+    applyWeights(myBytes.buffer); renderAll(); log(state.wNote);
+    lkSay(state.wStatus === 'loaded' ? 'Model downloaded: ' + state.wNote : 'Model downloaded but not used: ' + state.wNote, state.wStatus === 'loaded' ? 'ok' : 'bad');
+  } catch (e) { lkSay('Download model failed: ' + e.message + ' (the board has no myWeights.bin on its SD card yet?)', 'bad'); }
+}
+async function myDownloadImages() {
+  if (!lkPick()) { lkSay('Connect USB serial, WiFi or Bluetooth in section 8 first.', 'warn'); return; }
+  myStopTransfer = false; let myGot = 0, mySkip = 0;
+  try {
+    if (!state.mode) await myNewEmpty();
+    const myFolders = (await myListRemote('/images')).filter(r => r.size < 0 && !r.name.startsWith('.'));
+    const myMissing = myFolders.map(r => r.name).filter(n => !state.classes.includes(n));
+    if (myMissing.length && (state.classes.length === 0 || confirm('The board has folders this page does not have: ' + myMissing.join(', ') + '. Add them as classes? The model in memory is discarded.'))) {
+      for (const n of myMissing) { state.classes.push(n); if (state.mode === 'dir') await classDir(state.classes.length - 1, true); }
+      resetModel();
+    }
+    for (const f of myFolders) {
+      const ci = state.classes.indexOf(f.name); if (ci < 0) continue;
+      const myFiles = (await myListRemote('/images/' + f.name)).filter(r => r.size > 0 && /\.jpg$/i.test(r.name));
+      const myHave = new Set(state.samples.filter(x => x.cls === ci).map(x => x.name));
+      for (const r of myFiles) {
+        if (myStopTransfer) throw new Error('stopped');
+        if (myHave.has(r.name)) { mySkip++; continue; }
+        const myBlob = new Blob([await myReadRemote('/images/' + f.name + '/' + r.name)], { type: 'image/jpeg' });
+        if (state.mode === 'dir') await writeFile(await classDir(ci, true), r.name, myBlob);
+        addSample(ci, r.name, myBlob); myGot++;
+        lkSay('Downloading images: ' + f.name + ' ... ' + myGot + ' new, ' + mySkip + ' already here');
+      }
+    }
+    state.evalStale = true; renderAll();
+    lkSay('Done: ' + myGot + ' images downloaded, ' + mySkip + ' already here.', 'ok'); log('Downloaded ' + myGot + ' images from the board.');
+  } catch (e) { state.evalStale = true; renderAll(); lkSay('Download images: ' + e.message + ' (' + myGot + ' downloaded so far).', e.message === 'stopped' ? 'warn' : 'bad'); }
+}
+async function myUploadImages() {
+  if (!lkPick()) { lkSay('Connect USB serial, WiFi or Bluetooth in section 8 first.', 'warn'); return; }
+  if (!state.samples.length) { lkSay('This project has no images to upload.', 'warn'); return; }
+  if (!confirm('Upload ' + state.samples.length + ' images to the board SD card? Files the board already has are skipped.')) return;
+  myStopTransfer = false; let myUp = 0, mySkip = 0;
+  try {
+    for (let ci = 0; ci < state.classes.length; ci++) {
+      let myHave = new Set();
+      try { myHave = new Set((await myListRemote('/images/' + state.classes[ci])).map(r => r.name)); } catch (e) { /* the folder is not on the board yet */ }
+      for (const sm of state.samples.filter(x => x.cls === ci)) {
+        if (myStopTransfer) throw new Error('stopped');
+        if (myHave.has(sm.name)) { mySkip++; continue; }
+        await myPutRemote('/images/' + state.classes[ci] + '/' + sm.name, new Uint8Array(await sm.blob.arrayBuffer()));
+        myUp++; lkSay('Uploading images: ' + state.classes[ci] + ' ... ' + myUp + ' sent, ' + mySkip + ' already on the board');
+      }
+    }
+    lkSay('Done: ' + myUp + ' images uploaded, ' + mySkip + ' already on the board.', 'ok'); log('Uploaded ' + myUp + ' images to the board.');
+  } catch (e) { lkSay('Upload images: ' + e.message + ' (' + myUp + ' sent so far).', e.message === 'stopped' ? 'warn' : 'bad'); }
+}
+
+// ---------- New empty project: no SD card needed (everything stays in memory until Save .zip) ----------
+async function myNewEmpty() {
+  if (state.mode && (state.samples.length || state.dirty) && !confirm('Start an empty project? Unsaved images and the model in memory are discarded.')) return;
+  await ingest({ mode: 'zip', root: null, name: 'new project (memory only)', folders: [], items: [], cfg: null, weights: null, skipped: 0, hadImagesDir: true });
+}
+
 $('lkConnect').onclick = lkConnect;
 $('lkPush').onclick = lkPush;
 setInterval(lkBadges, 1000); lkBadges();
@@ -1679,7 +1984,7 @@ $('valMode').onchange = () => {
 $('valAmt').oninput = () => { renderClasses(); updateSplitInfo(); };
 $('epochs').oninput = () => { const v = parseInt($('epochs').value); if (v >= 1 && !state.training) { state.epochsPlanned = v; drawCharts(); } };
 document.addEventListener('keydown', e => {
-  if ((e.code !== 'Space' && e.code !== 'KeyB') || $('insp').open || $('rev').open || !state.stream) return;
+  if ((e.code !== 'Space' && e.code !== 'KeyB') || $('insp').open || $('rev').open || !myCamReady()) return;
   if (/^(INPUT|SELECT|TEXTAREA|BUTTON|SUMMARY)$/.test(document.activeElement.tagName)) return;
   e.preventDefault(); if (e.code === 'KeyB') burst(); else capture();
 });
@@ -1721,7 +2026,7 @@ if (!window.showDirectoryPicker) {
   $('dirNote').textContent = 'This browser has no folder picker (phones, Safari, Firefox). Use Load .zip, then Save .zip. Desktop Chrome or Edge can work directly on the SD card.';
 } else $('dirNote').textContent = 'Desktop Chrome or Edge: pick the SD card root and changes are written straight to the card. Other browsers: use .zip.';
 
-syncHeatControls(); syncLayoutControls(); renderAll();
+myCamSourceChange(); syncHeatControls(); syncLayoutControls(); renderAll();
 log('Vision CNN SD trainer ' + VERSION + ' ready. Layout ' + IN + 'x' + IN + 'x3, conv filters ' + C1F + '/' + C2F + ', ' + FLAT + ' flattened.');
 </script>
 </body>
