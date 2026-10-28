@@ -1,7 +1,16 @@
 <!DOCTYPE html>
 <!--
-  webMCU-AI  |  Vision CNN SD trainer + device link  |  v004
-  Companion page for the XIAO ESP32-S3 "FULL VISION ML" firmware (firmware-v004; firmware-v005 and later send debug frames).
+  webMCU-AI  |  Vision CNN SD trainer + device link  |  v009
+  Companion page for the XIAO ESP32-S3 "FULL VISION ML" firmware (firmware-v009; firmware-v005 and later send debug frames).
+  v009: Bluetooth now finds the board by its NAME (filter namePrefix XIAO-Vision), as the working dual-board BLE page does, because the
+        board advertises only its name. New section 9: LoRa network and messages (sum of what every nearby board saw, chat, settings),
+        working over USB, WiFi and Bluetooth. Needs firmware-v009. The LoRa history graph of the LoRa page is not included yet.
+  v008: the Bluetooth chooser filter is back to the v004 one and a Bluetooth connect now retries up to 3 times when the first link drops.
+  v007: UI POLISH. The WiFi box now shows the board's own address (ws://192.168.4.1:81) instead of the localhost bridge; the
+        servers are only needed when the page is opened from an https address (a downloaded copy of the repository does not need them).
+        The camera box now starts on the BOARD camera (USB, WiFi or Bluetooth) and a Bluetooth connect switches to it; a Bluetooth
+        picture gets 20 seconds instead of 4 (it is slow).
+        New Menu and Help buttons send @menu and @help (firmware-v007 or later).
   v004: ONE DEVICE LINK. Sections 8 and 9 are now one: three connect buttons (USB serial, WiFi, Bluetooth) and one send box.
         The same text commands work on all three. New buttons download and upload the model, config.json and images, so
         collecting, training and deploying never needs the SD card to leave the board. Web Bluetooth is new (Chrome or Edge).
@@ -23,7 +32,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vision CNN SD trainer + device link v004</title>
+<title>Vision CNN SD trainer + device link v009</title>
 <style>
 :root{--bg:#11151b;--panel:#182029;--panel2:#1f2a36;--line:#2c3947;--text:#dde5ee;--mut:#8b9aac;--acc:#66d1bd;--acc-ink:#062a24;--bad:#ef6b73;--warn:#e9b44c;--ok:#7bd88f;--r:8px}
 *{box-sizing:border-box}
@@ -107,12 +116,22 @@ button.burst.recording{background:var(--bad);color:#fff;border-color:var(--bad);
 .badge i{width:9px;height:9px;border-radius:50%;background:var(--mut)}
 .badge.on{border-color:var(--ok)}.badge.on i{background:var(--ok)}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+.lorabanner{border:1px solid var(--ok);border-radius:var(--r);padding:12px 16px;margin:10px 0;background:#0f1319}
+.lorabanner.alert{border-color:var(--bad);background:#2a1a1d}
+.lorabanner.wait{border-color:var(--line)}
+.lorabanner .big{font-size:26px;font-weight:650}
+.chip{display:inline-block;padding:1px 9px;margin:2px 4px 2px 0;border-radius:11px;background:var(--panel2);border:1px solid var(--line);font-size:12.5px}
+.chip.hot{border-color:var(--bad);color:#ffb3b8}
+#loraLog{max-height:260px;overflow:auto;font:13px/1.55 ui-monospace,Consolas,monospace;background:#0f1319;border:1px solid var(--line);border-radius:6px;padding:8px 12px}
+#loraLog .hot{color:#ffb3b8}
+#loraLog .msg{color:var(--acc)}
+#loraLog .who{font-weight:650}
 </style>
 </head>
 <body>
 <header>
-  <h1>Vision CNN SD trainer<span class="ver">v004 &middot; USB + WiFi + Bluetooth link</span></h1>
-  <p>Browser companion for the XIAO ESP32-S3 FULL VISION ML firmware (firmware-v004; firmware-v005 and later also give config.json class names and debug frames): load the SD card, add images, review and clean them, train the same CNN, then write myWeights.bin back to the card.</p>
+  <h1>Vision CNN SD trainer<span class="ver">v009 &middot; USB + WiFi + Bluetooth link</span></h1>
+  <p>Browser companion for the XIAO ESP32-S3 FULL VISION ML firmware (firmware-v009; firmware-v005 and later also give config.json class names and debug frames): load the SD card, add images, review and clean them, train the same CNN, then write myWeights.bin back to the card.</p>
   <p>Everything runs in this page. Images and weights never leave your computer.</p>
 </header>
 <main>
@@ -147,13 +166,13 @@ button.burst.recording{background:var(--bad);color:#fff;border-color:var(--bad);
     <div style="flex:1;min-width:230px">
       <div class="row">
         <select id="myCamSource" onchange="myCamSourceChange()" aria-label="Camera to use">
+          <option value="board" selected>Camera: the board (USB, WiFi or Bluetooth link)</option>
           <option value="web">Camera: this computer's webcam</option>
-          <option value="board">Camera: the board (USB or WiFi link)</option>
         </select>
         <button id="btnCam">Start camera</button>
         <button id="myBoardPreviewBtn" onclick="myBoardPreviewToggle()">Board preview</button>
       </div>
-      <p class="note" id="myCamNote">The webcam needs Start camera. The board camera needs a link: USB serial, WiFi or Bluetooth (section 8). Board pictures are saved exactly as the board made them (already flipped like its own images), so the Mirror box below only changes webcam frames.</p>
+      <p class="note" id="myCamNote">The board camera needs a link: USB serial, WiFi or Bluetooth (section 8); over Bluetooth a picture takes a few seconds. The webcam needs Start camera. Board pictures are saved exactly as the board made them (already flipped like its own images), so the Mirror box below only changes webcam frames.</p>
       <div class="row">
         <select id="capClass" aria-label="Class to capture into"></select>
         <button id="btnCapture" class="primary">Capture (Space)</button>
@@ -324,21 +343,25 @@ button.burst.recording{background:var(--bad);color:#fff;border-color:var(--bad);
     <button id="btnSerial" class="primary">Connect USB serial</button>
     <button id="lkConnect" class="primary">Connect WiFi</button>
     <button id="myBleBtn" class="primary" onclick="myBleConnect()">Connect Bluetooth</button>
-    <input type="text" id="lkHost" value="ws://localhost:8080/dev/192.168.4.1" aria-label="Board address for WiFi" style="min-width:300px">
+    <input type="text" id="lkHost" value="ws://192.168.4.1:81" aria-label="Board address for WiFi, for example ws://192.168.4.1:81" style="min-width:300px">
   </div>
   <p class="note" id="serStatus">USB serial not connected.</p>
   <div class="info" id="lkStatus">Nothing connected yet.</div>
   <label class="chk"><input type="checkbox" id="serDebug" checked> Ask the device for debug frames (firmware-v005 or later; leave off for Bluetooth, it is slow)</label>
   <textarea id="serOut" class="mono" readonly aria-label="Device output"></textarea>
   <div class="row">
-    <input type="text" id="serIn" placeholder="Command, e.g. t, l, 1, @info, @ls /images" aria-label="Command to send" style="flex:1;min-width:200px">
+    <input type="text" id="serIn" placeholder="Command, e.g. t, l, 1, @menu, @help, @info, @ls /images" aria-label="Command to send" style="flex:1;min-width:200px">
     <button id="serSend">Send</button>
+    <button onclick="mySendQuick('@menu')" title="Show the board's main menu again">Menu</button>
+    <button onclick="mySendQuick('@help')" title="List every key and command on the board">Help</button>
   </div>
   <details><summary>Commands you can type</summary>
 <pre>t          next item / capture a picture
 l          select / exit
 x          stop training
 1 .. 9     jump to a menu item
+@menu      show the board's main menu again (firmware-v007)
+@help      list every key and command, then the menu (firmware-v007)
 @info      layout, class names, SD card and weights
 @snap      one camera picture
 @ls /images                     list the class folders (add /&lt;class&gt; for the files)
@@ -358,7 +381,7 @@ x          stop training
     <button class="danger" onclick="myStopTransfer = true">Stop</button>
   </div>
   <div class="info" id="myInfoBox">Not asked yet. After a WiFi or Bluetooth connect the page compares the board's layout and class names with this page; with USB type @info.</div>
-  <p class="note">USB: 115200 baud, a newline is added to what you send. Close the Arduino IDE serial monitor first; opening the port can reboot the board. WiFi: the board joins your router or makes its own network "XIAO-Vision" (password xiaovision); keep the address above and run <code>node server-v004.js</code> or <code>python server-v004.py</code> on your computer, or type the board's address. Bluetooth: desktop Chrome or Edge (or Chrome on Android), board firmware with MY_USE_BLE 1. Models and many images take much longer over Bluetooth.</p>
+  <p class="note">USB: 115200 baud, a newline is added to what you send. Close the Arduino IDE serial monitor first; opening the port can reboot the board. WiFi: the board joins your router or makes its own network "XIAO-Vision" (password xiaovision). On its own network the address is <code>ws://192.168.4.1:81</code>; on your router use the address the Serial monitor shows, or <code>ws://xiao-vision.local:81</code>. A copy of this repository opened from your computer, or from http://localhost, connects straight to the board: no server needed. Only when the page is opened from an https address (such as GitHub Pages) does the browser block ws://; then run <code>node server-v004.js</code> or <code>python server-v004.py</code>, open the page from http://localhost:8080 and type <code>ws://localhost:8080/dev/192.168.4.1</code> here. Bluetooth: desktop Chrome or Edge (or Chrome on Android), board firmware with MY_USE_BLE 1. Models and many images take much longer over Bluetooth.</p>
   <h3>Device view</h3>
   <p class="note">With the box ticked, the firmware sends its camera JPEG (and a heatmap) every 10th inference, each saved image, and a slow live preview while collecting. Frame lines are shown here instead of in the monitor text. With a model in memory that has the same layout, the page runs the same JPEG through its own copy of the network and compares.</p>
   <div class="row"><label class="chk"><input type="checkbox" class="heatOverlay" checked> Overlay device heatmap on image</label></div>
@@ -366,6 +389,42 @@ x          stop training
     <canvas id="devCanvas" width="288" height="288"></canvas>
     <div style="flex:1;min-width:230px"><div class="info" id="devInfo">No debug frame yet. Connect, keep the box ticked, then run Infer or a collect mode on the device.</div><div id="devBars"></div></div>
   </div>
+</section>
+
+<!-- ============ 9 LORA NETWORK ============ -->
+<section id="s-lora">
+  <h2>9 LoRa network and messages</h2>
+  <p class="note">Each device runs the CNN on its own camera and sends a short LoRa summary every report period (30 s default): how many frames it saw of each class. Connect <b>one</b> device in section 8 (USB, WiFi or Bluetooth). This page adds up the summaries from every device it hears, plus its own, over the window below. Class 0 is the quiet base class: when only class 0 is seen, only the date and time are shown.</p>
+  <div class="row">
+    <label class="chk">Window <input type="number" id="loraWin" value="3" min="1" max="60" style="width:72px" aria-label="Window in minutes"> minutes</label>
+    <label class="chk"><input type="checkbox" id="loraBeep"> Beep when class 1 or higher is seen</label>
+    <button id="loraCsv" title="Only the last hour of reports. Section 10 keeps everything since connecting.">Export last-hour CSV</button><button id="loraClear" class="danger">Clear</button>
+  </div>
+  <div id="loraBanner" class="lorabanner wait"><div class="big">Waiting for LoRa reports</div><div class="note">Connect a device in section 8 and wait one report period.</div></div>
+  <h3>Summed result</h3>
+  <div class="tblwrap" id="loraSum"></div>
+  <h3>Devices</h3>
+  <div class="tblwrap" id="loraDevs"></div>
+  <h3>Event log</h3>
+  <div id="loraLog"></div>
+  <h3>Send a message</h3>
+  <div class="row cmd">
+    <input type="text" id="lcMsg" maxlength="80" placeholder="Message for every LoRa device that is listening" aria-label="LoRa message" style="flex:1;min-width:220px"><button id="lcMsgB">Send message</button>
+  </div>
+  <p class="note">Sent through the connected device (section 8). Its own line and every reply from other devices appear in the event log above, with the time, the device and the signal strength.</p>
+  <h3>Settings of the connected device</h3>
+  <div class="row cmd">
+    <input type="text" id="lcName" placeholder="device-a02" aria-label="Device name"><button id="lcNameB">Set name</button>
+    <input type="number" id="lcRep" placeholder="30" min="5" max="3600" aria-label="Report seconds"><button id="lcRepB">Set report s</button>
+    <input type="number" id="lcConf" placeholder="60" min="0" max="100" aria-label="Minimum confidence"><button id="lcConfB">Set min conf %</button>
+    <input type="number" id="lcCh" placeholder="0" min="0" max="120" aria-label="Channel"><button id="lcChB">Set channel</button>
+    <button id="lcInfoB">Refresh info</button>
+  </div>
+  <div class="row cmd">
+    <button id="lcSetB">Show commands and settings</button><button id="lcResetB" class="danger">Reset LoRa settings</button>
+  </div>
+  <p class="note">"Show commands and settings" prints the command list in the device output (section 8) with the current value of every setting and whether it is the default or saved in the device. The defaults themselves are in the USER SETTINGS block at the top of the firmware.</p>
+  <p class="note" id="loraInfo">No device info yet. All devices must use the same channel. Name, report period, confidence, channel and encryption are saved in the device. Summaries are sent while the device is inferring.</p>
 </section>
 
 </main>
@@ -418,7 +477,7 @@ x          stop training
 
 <script>
 'use strict';
-const VERSION = 'v004';
+const VERSION = 'v009';
 
 /* ==CORE START== (no DOM use below this line until CORE END) */
 
@@ -1062,7 +1121,7 @@ function grabFrame() {
 const frameBlob = () => (myCamSource === 'board' && myLastBoardBlob) ? Promise.resolve(myLastBoardBlob) : new Promise(r => capCanvas.toBlob(r, 'image/jpeg', 0.85));
 
 // ---------- camera source: the computer webcam or the board camera (v003) ----------
-let myCamSource = 'web';            // 'web' or 'board'
+let myCamSource = 'board';          // 'board' (USB, WiFi or Bluetooth) or 'web'; the page starts on the board camera
 let myLastBoardBlob = null;         // the newest picture from the board, exactly as the board made it
 let myBoardWaiter = null;           // waits for the next "@J" line from the board
 let myBoardChain = Promise.resolve();   // one picture request at a time
@@ -1075,7 +1134,7 @@ function myCamSourceChange() {
   $('myBoardPreviewBtn').style.display = myCamSource === 'board' ? '' : 'none';
   if (myCamSource === 'web') myBoardPreviewOn = false;
   state.live = false; $('btnLive').textContent = 'Start live';
-  log('Camera source: ' + (myCamSource === 'board' ? 'the board (needs a USB or WiFi link)' : 'this computer webcam') + '.');
+  log('Camera source: ' + (myCamSource === 'board' ? 'the board (needs a USB, WiFi or Bluetooth link)' : 'this computer webcam') + '.');
 }
 // True when the chosen camera can give a picture right now.
 function myCamReady() { return myCamSource === 'board' ? !!lkPick() : !!state.stream; }
@@ -1089,8 +1148,9 @@ async function myGrab() {
 async function myBoardGrabOnce() {
   const l = lkPick();
   if (!l) { log('Board camera: open the USB serial, WiFi or Bluetooth (section 8) link first.'); return false; }
+  const mySecs = l.kind === 'BLE' ? 20 : 4;         // Bluetooth sends the picture in small pieces, so it needs longer
   const myWait = new Promise((res, rej) => {
-    const t = setTimeout(() => { myBoardWaiter = null; rej(new Error('no picture from the board within 4 seconds')); }, 4000);
+    const t = setTimeout(() => { myBoardWaiter = null; rej(new Error('no picture from the board within ' + mySecs + ' seconds')); }, mySecs * 1000);
     myBoardWaiter = { res, t };
   });
   myWait.catch(() => {});
@@ -1367,7 +1427,7 @@ async function toggleLive() {
   if (state.live) { state.live = false; $('btnLive').textContent = 'Start live'; return; }
   if (!hasModel()) { log('Live: no model in memory. Train, or load a folder with header/myWeights.bin first.'); $('liveBanner').textContent = 'No model yet'; return; }
   if (myCamSource === 'web') { await startCam(); if (!state.stream) return; }
-  else if (!lkPick()) { log('Live: open a USB or WiFi link to the board first.'); return; }
+  else if (!lkPick()) { log('Live: open a USB, WiFi or Bluetooth link to the board first (section 8).'); return; }
   state.live = true; $('btnLive').textContent = 'Stop live'; liveLoop();
 }
 async function liveLoop() {
@@ -1389,7 +1449,7 @@ async function liveLoop() {
 }
 
 // ---------- save ----------
-const configJson = () => JSON.stringify({ page: 'vision-cnn-sd-trainer ' + VERSION, firmware: 'FULL VISION ML firmware-v004', input_size: IN, input_channels: 3, conv1_filters: C1F, conv2_filters: C2F, kernel_size: 3, classes: state.classes, weights_file: 'header/myWeights.bin', weights_floats: totalFloats(state.classes.length), note: 'Class names are read by this page and by the firmware at boot. NUM_CLASSES, INPUT_SIZE and filter counts are compile-time in the sketch.' }, null, 2);
+const configJson = () => JSON.stringify({ page: 'vision-cnn-sd-trainer ' + VERSION, firmware: 'FULL VISION ML firmware-v009', input_size: IN, input_channels: 3, conv1_filters: C1F, conv2_filters: C2F, kernel_size: 3, classes: state.classes, weights_file: 'header/myWeights.bin', weights_floats: totalFloats(state.classes.length), note: 'Class names are read by this page and by the firmware at boot. NUM_CLASSES, INPUT_SIZE and filter counts are compile-time in the sketch.' }, null, 2);
 
 async function saveWeights() {
   const st = $('saveStatus');
@@ -1463,7 +1523,7 @@ async function burst() {
   if (!state.mode) { log('Load a data source first (section 1).'); return; }
   const ci = parseInt($('capClass').value);
   if (!state.classes[ci]) { log('Add or pick a class first.'); return; }
-  if (!myCamReady()) { log(myCamSource === 'board' ? 'Open a USB or WiFi link to the board first.' : 'Start the camera first.'); return; }
+  if (!myCamReady()) { log(myCamSource === 'board' ? 'Open a USB, WiFi or Bluetooth link to the board first (section 8).' : 'Start the camera first.'); return; }
   let dir = null;
   if (state.mode === 'dir') { try { dir = await classDir(ci, true); } catch (e) { log('Cannot open the class folder: ' + e.message); return; } }
   bursting = true;
@@ -1599,6 +1659,11 @@ async function serConnect() {
   const rd = ser.reader;
   (async () => { try { for (;;) { const { value, done } = await rd.read(); if (done) break; if (value) serFeed(value); } } catch (e) { /* closed */ } if (ser.port === port) serDisconnect(); })();
 }
+async function mySendQuick(myCmd) {
+  const l = lkPick();
+  if (!l) { lkSay('Connect USB serial, WiFi or Bluetooth in section 8 first.', 'warn'); return; }
+  try { await l.text(myCmd); serAppend('> ' + myCmd + '\n'); } catch (e) { log('Send failed: ' + e.message); }
+}
 async function serSend() {
   const t = $('serIn').value, l = lkPick();
   if (!t) return;
@@ -1612,6 +1677,115 @@ let serPend = '', serBeat = null;
 const dev = { f: null, tok: 0 };
 function serDebugSync() { const c = $('serDebug').checked ? 'D' : 'd'; if (ser.writer) ser.writer.write(c).catch(() => {}); lkSendText(c); if (myBle.rx) myBleWrite(c + '\n').catch(() => {}); }   // heartbeat on every open link
 const b64ToBytes = s => { const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; };
+let lhDirty = false;
+// ---------- LoRa network: event log, messages, settings buttons ----------
+const lora = { reports: [], devs: {}, classes: null, log: [], logDirty: true, beepAt: 0, hist: [], hmsgs: [], t0: 0, view: null, loaded: 0, histClasses: null };
+const loraWinMs = () => Math.min(60, Math.max(1, parseFloat($('loraWin').value) || 3)) * 60000;
+const loraCls = i => (lora.classes && lora.classes[i]) || state.classes[i] || ('class ' + i);
+const p2 = n => String(n).padStart(2, '0');
+const stamp = t => { const d = new Date(t); return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds()); };
+async function loraCmd(t) {
+  const l = lkPick();
+  if (!l) { log('Connect USB serial, WiFi or Bluetooth first (section 8).'); return; }
+  try { await l.text(t); serAppend('> ' + t + '\n'); setTimeout(() => { const k = lkPick(); if (k) k.text('@pageinfo').catch(() => {}); }, 500); } catch (e) { log('Send failed: ' + e.message); }
+}
+function loraBeep() {
+  if (!$('loraBeep').checked || Date.now() - lora.beepAt < 5000) return; lora.beepAt = Date.now();
+  try { const a = new (window.AudioContext || window.webkitAudioContext)(), o = a.createOscillator(), g = a.createGain(); o.frequency.value = 880; g.gain.value = 0.15; o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + 0.18); } catch (e) { /* no audio */ }
+}
+function loraSumText(seq, period, frames, counts) {
+  const unsure = frames - counts.reduce((a, b) => a + b, 0);
+  return 'summary #' + seq + ', ' + period + ' s window, ' + frames + ' frames: ' + counts.map((v, k) => loraCls(k) + ' ' + v).join(', ') + (unsure > 0 ? ', unsure ' + unsure + ' (below the confidence limit)' : '');
+}
+function loraLine(line) {
+  if (line.startsWith('@LORA-MSG')) {
+    const m = /^@LORA-MSG (\S+) (\S+) (.*)$/.exec(line); if (!m) return;
+    const self = m[1] === 'self';
+    lora.log.unshift({ t: Date.now(), kind: 'msg', self, rssi: self ? null : +m[1], snr: self ? null : +m[2], text: m[3] });
+    if (lora.log.length > 300) lora.log.length = 300;
+    lora.hmsgs.push({ t: Date.now(), self, rssi: self ? null : +m[1], snr: self ? null : +m[2], text: m[3] });
+    lora.logDirty = true; loraRender(); return;
+  }
+  if (line.startsWith('@LORA-INFO')) {
+    const m = /classes=(.*)$/.exec(line); if (m && m[1]) lora.classes = m[1].split(',');
+    const kv = {}; line.replace(/(\w+)=([^\s]+)/g, (a, k, v) => kv[k] = v);
+    $('loraInfo').textContent = 'Connected device: ' + kv.name + ', channel ' + kv.ch + ' (' + (915 + kv.ch * 0.1).toFixed(1) + ' MHz), report every ' + kv.report + ' s, min confidence ' + kv.conf + '%, radio ' + kv.radio + '. Classes: ' + (lora.classes || []).join(', ');
+    loraRender(); return;
+  }
+  const f = line.split(' '); if (f[0] !== '@LORA' || f.length < 4) return;
+  const pk = f.slice(3).join(' ').split(','); if (pk[0] !== 'S' || pk.length < 6) return;
+  const name = pk[1], seq = +pk[2], period = +pk[3], frames = +pk[4], counts = pk.slice(5).map(Number);
+  if (!name || [seq, period, frames].concat(counts).some(v => !Number.isFinite(v))) return;
+  const now = Date.now(), self = f[1] === 'self';
+  const d = lora.devs[name] || (lora.devs[name] = { name, last: 0, seq: -1, missed: 0, reboots: 0, n: 0, rssi: null, snr: null, period, self });
+  if (d.seq >= 0) { if (seq > d.seq + 1) d.missed += seq - d.seq - 1; else if (seq <= d.seq) d.reboots++; }
+  Object.assign(d, { seq, last: now, period, self, rep: { seq, period, frames, counts } }); d.n++;
+  if (!self) { d.rssi = +f[1]; d.snr = +f[2]; }
+  lora.reports.push({ t: now, name, seq, period, frames, counts });
+  lora.reports = lora.reports.filter(r => now - r.t <= 3600000);
+  lora.hist.push({ t: now, name, self, seq, period, frames, counts, rssi: self ? null : +f[1], snr: self ? null : +f[2] }); lhDirty = true;
+  const hot = counts.slice(1).map((v, i) => v > 0 ? loraCls(i + 1) + ' \u00d7' + v : '').filter(Boolean);
+  lora.log.unshift({ t: now, kind: 'sum', name, self, rssi: self ? null : +f[1], snr: self ? null : +f[2], hot: hot.length > 0, counts, seq, period, frames }); if (lora.log.length > 300) lora.log.length = 300;
+  lora.logDirty = true; if (hot.length) loraBeep();
+  loraRender();
+}
+function loraRender() {
+  const now = Date.now(), win = loraWinMs(), rs = lora.reports.filter(r => now - r.t <= win), tot = [], who = [];
+  rs.forEach(r => r.counts.forEach((v, k) => { tot[k] = (tot[k] || 0) + v; if (v > 0 && k > 0) { who[k] = who[k] || {}; who[k][r.name] = (who[k][r.name] || 0) + v; } }));
+  const act = []; for (let k = 1; k < tot.length; k++) if (tot[k] > 0) act.push(k);
+  const b = $('loraBanner'), mins = win / 60000;
+  if (!Object.keys(lora.devs).length) { b.className = 'lorabanner wait'; }
+  else if (!act.length) { b.className = 'lorabanner'; b.innerHTML = '<div class="big">' + stamp(now) + '</div>'; }
+  else {
+    b.className = 'lorabanner alert';
+    const last = rs.filter(r => r.counts.slice(1).some(v => v > 0)).pop();
+    b.innerHTML = '<div class="big">' + act.map(k => esc(loraCls(k)) + ' \u00d7' + tot[k]).join(', ') + '</div><div class="note">Last ' + mins + ' min, latest ' + (last ? stamp(last.t) : '') + '</div>';
+  }
+  $('loraSum').innerHTML = act.length ? '<table><thead><tr><th>Class</th><th>Frames in last ' + mins + ' min</th><th>Devices</th></tr></thead><tbody>' +
+    act.map(k => '<tr><td><b>' + esc(loraCls(k)) + '</b></td><td>' + tot[k] + '</td><td>' + Object.entries(who[k]).map(([n, v]) => '<span class="chip hot">' + esc(n) + ' ' + v + '</span>').join('') + '</td></tr>').join('') + '</tbody></table>'
+    : '<p class="note">' + (rs.length ? 'Only class 0 in the last ' + mins + ' minutes.' : 'No reports in the last ' + mins + ' minutes.') + '</p>';
+  const names = Object.keys(lora.devs).sort();
+  $('loraDevs').innerHTML = names.length ? '<table><thead><tr><th>Device</th><th>Heard</th><th>Signal</th><th>Reports</th><th>Missed</th><th>Last ' + mins + ' min</th><th>Latest report</th><th>Status</th></tr></thead><tbody>' + names.map(n => {
+    const d = lora.devs[n], age = Math.round((now - d.last) / 1000), mine = rs.filter(r => r.name === n), c = [];
+    mine.forEach(r => r.counts.forEach((v, k) => { if (k > 0 && v > 0) c[k] = (c[k] || 0) + v; }));
+    const chips = c.map((v, k) => v ? '<span class="chip hot">' + esc(loraCls(k)) + ' ' + v + '</span>' : '').join('') || (mine.length ? '<span class="note">quiet</span>' : '-');
+    const silent = age > 2.5 * d.period + 10;
+    return '<tr><td>' + esc(n) + '</td><td>' + (age < 120 ? age + ' s ago' : Math.round(age / 60) + ' min ago') + '</td><td>' + (d.self ? 'this device' : d.rssi + ' dBm, SNR ' + d.snr) + '</td><td>' + d.n + '</td><td>' + d.missed + (d.reboots ? ' (' + d.reboots + ' restarts)' : '') + '</td><td>' + chips + '</td><td class="note">' + (d.rep ? esc(loraSumText(d.rep.seq, d.rep.period, d.rep.frames, d.rep.counts)) : '-') + '</td><td class="' + (silent ? 'bad' : 'ok') + '">' + (silent ? 'silent' : 'live') + '</td></tr>';
+  }).join('') + '</tbody></table>' : '<p class="note">No devices heard yet.</p>';
+  if (lora.logDirty) {
+    lora.logDirty = false;
+    const sig = e => e.self ? '' : '  <span class="note">(' + e.rssi + ' dBm, SNR ' + e.snr + ')</span>';
+    $('loraLog').innerHTML = lora.log.length ? lora.log.slice(0, 200).map(e => e.kind === 'msg'
+      ? '<div class="msg">' + stamp(e.t) + '  ' + (e.self ? 'this device sent message' : 'heard message') + '  <span class="who">' + esc(e.text) + '</span>' + sig(e) + '</div>'
+      : '<div class="' + (e.hot ? 'hot' : '') + '">' + stamp(e.t) + '  ' + (e.self ? 'this device sent' : 'heard') + '  <span class="who">' + esc(e.name) + '</span>  ' + esc(loraSumText(e.seq, e.period, e.frames, e.counts)) + sig(e) + '</div>').join('') : '<span class="note">Nothing yet.</span>';
+  }
+}
+function loraCsv() {
+  const K = Math.max(1, ...lora.reports.map(r => r.counts.length)), head = ['time', 'device', 'seq', 'period_s', 'frames'];
+  for (let k = 0; k < K; k++) head.push('"' + loraCls(k).replace(/"/g, '""') + '"');
+  const rows = [head.join(',')].concat(lora.reports.map(r => [stamp(r.t), r.name, r.seq, r.period, r.frames].concat(r.counts).join(',')));
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv' })); a.download = 'lora-' + stamp(Date.now()).replace(/[: ]/g, '-') + '.csv';
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+$('loraCsv').onclick = loraCsv;
+$('loraClear').onclick = () => { lora.reports = []; lora.devs = {}; lora.log = []; lora.logDirty = true; loraRender(); };
+$('loraWin').oninput = loraRender;
+$('lcNameB').onclick = () => { const v = $('lcName').value.trim(); if (/^[A-Za-z0-9_-]{1,19}$/.test(v)) loraCmd('@name ' + v); else alert('Name: 1 to 19 letters, digits, - or _'); };
+$('lcRepB').onclick = () => { const v = parseInt($('lcRep').value); if (v >= 5 && v <= 3600) loraCmd('@report ' + v); else alert('Report period 5 to 3600 seconds'); };
+$('lcConfB').onclick = () => { const v = parseInt($('lcConf').value); if (v >= 0 && v <= 100) loraCmd('@conf ' + v); else alert('Confidence 0 to 100'); };
+$('lcChB').onclick = () => { const v = parseInt($('lcCh').value); if (v >= 0 && v <= 120) loraCmd('@channel ' + v); else alert('Channel 0 to 120'); };
+$('lcInfoB').onclick = () => loraCmd('@pageinfo');
+$('lcSetB').onclick = () => loraCmd('@help');
+$('lcResetB').onclick = () => { if (confirm('Put the LoRa name, report period, channel, confidence and encryption back to the firmware defaults?')) loraCmd('@lorareset'); };
+$('lcMsgB').onclick = async () => {
+  const v = $('lcMsg').value.replace(/[\r\n]+/g, ' ').trim(); if (!v) return;
+  const l = lkPick();
+  if (!l) { log('Connect USB serial, WiFi or Bluetooth first (section 8).'); return; }
+  try { await l.text('@lora ' + v); serAppend('> @lora ' + v + '\n'); $('lcMsg').value = ''; } catch (e) { log('Send failed: ' + e.message); }
+};
+$('lcMsg').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); $('lcMsgB').click(); } };
+setInterval(loraRender, 1000); loraRender();
+
 // Text goes to the monitor; complete lines that start with '@' are debug frames.
 function serFeed(chunk) {
   serPend += chunk;
@@ -1678,6 +1852,7 @@ function lkBadges() {
 // One incoming line, from USB or WiFi: replies, debug frames, or plain text for the monitor.
 function lkLine(line) {
   if (/^[AEY],/.test(line)) { lkSettle(line.trim()); return; }
+  if (line.startsWith('@LORA')) { loraLine(line.trim()); return; }
   if (line.startsWith('@J ')) { myBoardFrameLine(line.trim()); return; }
   if (line.startsWith('@L ')) { myListLine(line.trim()); return; }
   if (line.startsWith('@D ')) { myDataLine(line.trim()); return; }
@@ -1708,7 +1883,7 @@ function lkConnect() {
   ws.binaryType = 'arraybuffer'; lk.ws = ws; lkBadges();
   ws.onopen = () => { lkSay('WiFi connected to ' + url, 'ok'); log('WiFi link open: ' + url); lkBadges(); serDebugSync(); lk.beat = setInterval(serDebugSync, 5000); setTimeout(() => myBoardInfo(false), 800); };
   ws.onmessage = e => { if (typeof e.data === 'string') e.data.split('\n').forEach(l => { if (l) lkLine(l); }); };
-  ws.onerror = () => lkSay('WiFi connection failed. Same network as the board? Is firmware-v004 running (Serial monitor shows the address)?', 'bad');
+  ws.onerror = () => lkSay('WiFi connection failed. Same network as the board? Is firmware-v009 running (Serial monitor shows the address)?', 'bad');
   ws.onclose = () => { if (lk.ws === ws) lk.ws = null; clearInterval(lk.beat); lk.beat = null; lkBadges(); log('WiFi link closed.'); };
 }
 // Whichever link is open: WiFi first (binary frames, fast), else USB (hex text lines, slow but works anywhere).
@@ -1758,14 +1933,19 @@ async function myBleConnect() {
   if (!navigator.bluetooth) { lkSay('Web Bluetooth is not available in this browser. Use desktop Chrome or Edge, or Chrome on Android.', 'bad'); return; }
   try {
     lkSay('Pick the board in the Bluetooth window ...');
-    const myDev = await navigator.bluetooth.requestDevice({ filters: [{ services: [myBleSvcId] }] });
+    const myDev = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'XIAO-Vision' }], optionalServices: [myBleSvcId] });
     myDev.addEventListener('gattserverdisconnected', myBleGone);
-    const myServer = await myDev.gatt.connect(), mySvc = await myServer.getPrimaryService(myBleSvcId);
+    let myServer, mySvc;
+    for (let myTry = 1; myTry <= 3; myTry++) {      // a first connect to an ESP32 often drops at once, so try again
+      try { myServer = await myDev.gatt.connect(); mySvc = await myServer.getPrimaryService(myBleSvcId); break; }
+      catch (e) { if (myTry === 3) throw e; lkSay('Bluetooth link dropped, trying again (' + myTry + ' of 3) ...'); try { myDev.gatt.disconnect(); } catch (x) { /* already down */ } await sleep(800); }
+    }
     myBle.rx = await mySvc.getCharacteristic(myBleRxId); myBle.tx = await mySvc.getCharacteristic(myBleTxId);
     myBle.tx.addEventListener('characteristicvaluechanged', e => serFeed(myBle.dec.decode(e.target.value, { stream: true })));
     await myBle.tx.startNotifications();
     myBle.dev = myDev; $('serDebug').checked = false;
     $('myBleBtn').textContent = 'Disconnect Bluetooth';
+    if (!state.stream && myCamSource !== 'board') { $('myCamSource').value = 'board'; myCamSourceChange(); }   // use the board camera over Bluetooth
     lkSay('Bluetooth connected to ' + (myDev.name || 'the board') + '. Debug frames are off (slow over Bluetooth); tick the box to turn them on.', 'ok'); log('Bluetooth link open.');
     myBle.beat = setInterval(serDebugSync, 5000); lkBadges(); setTimeout(() => myBoardInfo(false), 800);
   } catch (e) { if (e.name !== 'NotFoundError') lkSay('Bluetooth: ' + e.message, 'bad'); myBleGone(); }
@@ -1859,7 +2039,7 @@ async function myApplySetup(myNames, mySize, myC1, myC2) {
 async function myBoardInfo(adopt) {
   const box = $('myInfoBox'); let r;
   try { r = await myAsk('@info'); }
-  catch (e) { box.innerHTML = '<span class="bad">The board did not answer: ' + esc(e.message) + ' (needs firmware-v004).</span>'; return; }
+  catch (e) { box.innerHTML = '<span class="bad">The board did not answer: ' + esc(e.message) + ' (needs firmware-v004 or later).</span>'; return; }
   const f = r.val.split('|');                 // info|v004|64|4|8|a,b,c|sd=1|w=1
   if (f[0] !== 'info' || f.length < 8) { box.textContent = 'Unexpected answer: ' + r.val; return; }
   const b = { size: +f[2], c1: +f[3], c2: +f[4], names: f[5] ? f[5].split(',') : [], sd: f[6] === 'sd=1', w: f[7] === 'w=1' };
