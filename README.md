@@ -18,10 +18,11 @@ You have three files:
 
 ## One-time setup
 
-1. Open `firmware-v002.ino` in the Arduino IDE.
+0. Download this repository
+1. Open `firmware.ino` in the Arduino IDE.
 2. Choose the board **XIAO_ESP32S3**, turn **PSRAM: OPSRAM** on, and upload.
 3. Put a FAT32-formatted SD card in the board (needed for Way 1, and used by the others as a backup).
-4. Open `index-v002.html` in Chrome or Edge (double-click it).
+4. Open `index.html` in Chrome or Edge (double-click it), or if you have internet access try [https://webmcu-ai.github.io/on-device-full-iot/index.html](https://webmcu-ai.github.io/on-device-full-iot/index.html)
 
 ## The big picture
 
