@@ -1,5 +1,5 @@
 // =============================================================================
-//  XIAO ESP32S3 SENSE / XIAO ML KIT  -  FULL VISION ML  -  firmware-v004  (USB + WiFi + Bluetooth link)
+//  XIAO ESP32S3 SENSE / XIAO ML KIT  -  FULL VISION ML  -  firmware-v009  (USB + WiFi + Bluetooth link)
 //
 //  Collect small images, train a tiny CNN, and classify what the camera sees,
 //  all on the microcontroller. A companion web page can do the training faster.
@@ -11,6 +11,17 @@
 //  LinkedIn https://www.linkedin.com/in/jeremy-ellis-4237a9bb/
 //
 // -----------------------------------------------------------------------------
+//  NEW IN v009
+//    - Bluetooth advertising now copies the working dual-board BLE sketch: the board advertises its NAME only
+//      (adv->setName) and the page finds it with a name filter. The service id is found after connecting.
+//    - LoRa (set MY_USE_LORA 0 to leave it out): chat messages and class summaries between boards, from the
+//      working firmware-lora-v009 code. The radio shares the SPI bus with the SD card (SCK D8, MISO D9, MOSI D10).
+//        @lora <text>   send a message to every board listening     @say <text>  the same
+//        @name @report @conf @channel @encrypt @seed @time @lorastatus @lorareset @pageinfo   (see @help)
+//      Messages and summaries also reach the page over USB, WiFi and Bluetooth as @LORA lines.
+//    - The touch pad on A0 is off while LoRa is on (MY_TOUCH_ENABLED), because LoRa DIO1 uses the same pin D0.
+//    - v007 added @help and @menu. v008 was an unsuccessful Bluetooth attempt.
+//
 //  NEW IN v004: ONE TEXT PROTOCOL ON USB, WiFi AND BLUETOOTH, WITH FILE TRANSFER
 //    The page's "Connect USB serial", "Connect WiFi" and "Connect Bluetooth" buttons all talk to the same code below
 //    (you normally use one at a time). Type a command in the page's send box, or in the Arduino serial monitor:
@@ -22,6 +33,8 @@
 //        @read <offset> <len> <path>   one piece (up to 1536 bytes):  @D <offset> <sum> <base64>
 //        @put <bytes> <sum> <path>     start an image upload (path /images/<class>/<file>); then  @w<offset>,<sum>,<base64>
 //        @cfg <json>                   save /header/config.json         @model <bytes> <sum>  weights push (as before)
+//        @help                         (v007) all keys and commands, then the menu
+//        @menu                         (v007) show the main menu again
 //    Paths may start with /images or /header. The page uses @read for "Download model / config.json / images"
 //    and @model for "Upload model", @cfg for "Upload config.json", @put for "Upload images".
 //    Bluetooth (MY_USE_BLE): library "NimBLE-Arduino" version 2.x. Set MY_USE_BLE to 0 to leave it out.
@@ -148,6 +161,32 @@ const char* myBleName = "XIAO-Vision";
 #define MY_BLE_TX_UUID      "7a1b0003-5d7c-4f6e-9a3e-0f2c4b1d8e01"   // the board sends lines here (notify)
 #define MY_BLE_RING 4096                   // bytes the page may have in flight
 
+// ---- LoRa settings (v009) --------------------------------------------------------
+// Wiring (XIAO ESP32S3 Sense header, SX1262 module): SCK D8, MISO D9, MOSI D10 (shared with the SD card),
+// NSS D3, RST D2, BUSY D1, DIO1 D0, 3V3, GND. Fit the antenna BEFORE powering the module.
+// The camera uses the B2B connector, so a Wio-SX1262 stacked on it cannot be used together with the camera.
+#define MY_USE_LORA            1                // 1 = LoRa chat and summaries, 0 = leave LoRa out
+#define MY_TOUCH_ENABLED       (!MY_USE_LORA)   // the A0 touch pad is D0, the same pin as LoRa DIO1
+#define MY_DEFAULT_NAME        "device-a01"     // board name in every LoRa report: make it unique per board
+#define MY_DEFAULT_REPORT_SEC  30               // seconds between summaries while inferring (5..3600)
+#define MY_DEFAULT_CHANNEL     0                // 0..120: 915.0 MHz + channel x 0.1 MHz, all boards must match
+#define MY_DEFAULT_MIN_CONF    60               // % confidence a frame needs to count as a class
+#define MY_DEFAULT_ENCRYPT     0                // 1 = scramble the text with the seed (casual listeners only)
+#define MY_DEFAULT_SEED        "maker100"       // must match on all boards
+#define LORA_SCK  D8
+#define LORA_MISO D9
+#define LORA_MOSI D10
+#define LORA_NSS  D3
+#define LORA_RST  D2
+#define LORA_BUSY D1
+#define LORA_DIO1 D0
+#define MY_SD_CS  21
+#define MY_LORA_RXEN   -1                       // RF switch pins if the module has them, -1 = not used
+#define MY_LORA_TXEN   -1
+#define MY_LORA_TCXO_V 1.8f                     // 0 for a module without a TCXO
+#define MY_LORA_DIO2_RF true
+#define MY_LORA_MAX    100                      // longest packet, name and text included
+
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "FS.h"
@@ -158,6 +197,11 @@ const char* myBleName = "XIAO-Vision";
 #include <U8g2lib.h>
 #include <Wire.h>
 #include "mbedtls/base64.h"
+#include <stdarg.h>
+#if MY_USE_LORA
+  #include <RadioLib.h>        // library RadioLib (jgromes)
+  #include <Preferences.h>
+#endif
 #if MY_USE_WIFI
   #include <WiFi.h>
   #include <ESPmDNS.h>
@@ -178,6 +222,26 @@ const char* myBleName = "XIAO-Vision";
 // so up to 7 classes can be picked by digit; more still work with t and l.
 #define NUM_CLASSES 3
 String myClassLabels[NUM_CLASSES] = {"0Blank", "1Cup", "2Pen"};
+
+// ---- LoRa state (v009) ----
+#if MY_USE_LORA
+SX1262 myRadio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
+Preferences myPrefs;
+volatile bool myLoraFlag = false;
+bool myLoraOk = false, myLoraTxBusy = false;
+unsigned long myLoraTxStart = 0;
+char myLoraName[24] = MY_DEFAULT_NAME;
+int myLoraChannel = MY_DEFAULT_CHANNEL;
+bool myLoraEncrypt = MY_DEFAULT_ENCRYPT;
+char myLoraSeed[32] = MY_DEFAULT_SEED;
+int myLoraReportSec = MY_DEFAULT_REPORT_SEC;
+int myLoraMinConf = MY_DEFAULT_MIN_CONF;
+unsigned long myLoraSeq = 0, myLoraTxN = 0, myLoraRxN = 0, myLoraErrN = 0;
+uint16_t myLoraCounts[NUM_CLASSES];
+uint32_t myLoraFrames = 0;
+unsigned long myLoraWinStart = 0, myLoraNext = 0, myLoraInfoLast = 0;
+long myLoraClockBase = -1;     // -1 = stamps show time since boot; else seconds of the day minus uptime
+#endif
 
 // ---- Model layout (must match the web page, see the header comment) -----------
 // INPUT_SIZE: square and EVEN. Photos on the SD card are always 240x240 and are
@@ -473,6 +537,28 @@ void   myLkPutBegin(const String& args);
 void   myLkPutChunk(const String& line);
 void   myLkPutFinish();
 void   myLkBleBegin();
+void   myLkHelp();
+void   myLoraSay(const char* fmt, ...);
+void   myLoraBegin();
+void   myLoraService();
+void   myLoraCount(int pred, float p);
+void   myLoraHelp();
+bool   myLoraCommand(char* l);
+#if MY_USE_LORA
+void IRAM_ATTR myLoraIsr();
+float  myLoraFreq();
+void   myLoraCipher(char* b, bool enc);
+void   myLoraSave();
+void   myLoraLoad();
+void   myLoraPrintInfo(bool force);
+void   myLoraStamp(char* out, size_t n);
+bool   myLoraExplain(const char* pkt, char* name, size_t nn, char* out, size_t n);
+bool   myLoraTransmit(char* pkt);
+bool   myLoraSendText(const char* text);
+void   myLoraReport();
+void   myLoraStatus();
+#endif
+void   myLkMenu();
 void   myBleService();
 void   myBleFeed(char c);
 void   myBleSend(const char* s, size_t n);
@@ -516,6 +602,8 @@ void myActionInfer();
 String myMenuLabel(int item);
 void myResetMenuState();
 void myDrawMenu();
+void myMenuSay(const String& s);
+void myPrintMenuText();
 void myExecuteMenuItem(int idx);
 void myHandleMenuNavigation();
 
@@ -528,7 +616,7 @@ void setup() {
   while (!Serial && millis() < 3000);
   delay(1000);
 
-  Serial.println("\n=== XIAO ESP32S3 Vision ML (firmware-v004) ===");
+  Serial.println("\n=== XIAO ESP32S3 Vision ML (firmware-v009) ===");
   Serial.printf("Layout: INPUT_SIZE %d, CONV1_FILTERS %d, CONV2_FILTERS %d, NUM_CLASSES %d\n",
                 INPUT_SIZE, CONV1_FILTERS, CONV2_FILTERS, NUM_CLASSES);
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
@@ -546,7 +634,9 @@ void setup() {
     myResizeLut[i] = min((int)((i + 0.5) * 240.0 / INPUT_SIZE), 239);
   }
 
+#if MY_TOUCH_ENABLED
   pinMode(A0, INPUT);
+#endif
   u8g2.begin();
   u8g2.setFont(u8g2_font_6x10_tf);
 
@@ -554,6 +644,9 @@ void setup() {
   pinMode(21, OUTPUT);
   digitalWrite(21, HIGH);
   delay(100);
+#if MY_USE_LORA
+  pinMode(LORA_NSS, OUTPUT); digitalWrite(LORA_NSS, HIGH);   // the radio stays quiet while the SD card starts
+#endif
   Serial.println("Checking SD card...");
   SPI.begin();
   SPI.setFrequency(400000);
@@ -621,6 +714,7 @@ void setup() {
   Serial.println("[boot 9] allocating model memory"); Serial.flush();
   myAllocateMemory();      // inference memory + random starting weights
   Serial.println("[boot 10] memory ready"); Serial.flush();
+  myLoraBegin();           // LoRa radio (does nothing when MY_USE_LORA is 0)
 
   Serial.printf("Weight file for this layout: %u bytes\n", (unsigned)MY_EXPECTED_WEIGHT_BYTES);
   Serial.printf("Training on the device needs about %u KB of PSRAM (free now: %u KB)\n",
@@ -738,12 +832,16 @@ void myDisplayImageOnOLED(camera_fb_t* fb, int imageCount) {
 
 // Average of three readings of the touch pad.
 int myReadTouch() {
+#if MY_TOUCH_ENABLED
   int sum = 0;
   for (int i = 0; i < 3; i++) {
     sum += analogRead(A0);
     delayMicroseconds(100);
   }
   return sum / 3;
+#else
+  return 0;                                   // pin D0 belongs to LoRa DIO1: no touch pad
+#endif
 }
 
 void myResetTouchState() {
@@ -1294,12 +1392,349 @@ void myLkWifiBegin() {
 }
 
 // Call often (every loop and every frame): keeps the WebSocket connection alive.
+// =============================================================================
+//  LORA (v009): summaries and messages between boards, from the working firmware-lora-v009 code.
+//  SX1262: 915 MHz + channel x 0.1 MHz, SF9, BW 125 kHz, CR 4/7, 22 dBm, sync word 0x3444.
+//  Every line goes to USB, WiFi and Bluetooth through myLoraSay(); machine lines start with @LORA.
+// =============================================================================
+// One formatted line to every open link (a leading newline is dropped).
+void myLoraSay(const char* fmt, ...) {
+  char b[300];
+  va_list a;
+  va_start(a, fmt);
+  vsnprintf(b, sizeof(b), fmt, a);
+  va_end(a);
+  const char* p = b;
+  while (*p == '\n') p++;
+  myLkEmit(p, strlen(p));
+}
+
+#if MY_USE_LORA
+void IRAM_ATTR myLoraIsr() { myLoraFlag = true; }
+
+float myLoraFreq() { return 915.0f + myLoraChannel * 0.1f; }
+
+// Printable-ASCII Vigenere cipher: hides text from casual listeners, it is NOT strong security.
+void myLoraCipher(char* b, bool enc) {
+  int sl = strlen(myLoraSeed);
+  if (sl == 0) return;
+  for (int i = 0; b[i]; i++) {
+    char c = b[i];
+    if (c >= 32 && c <= 126) {
+      int sh = myLoraSeed[i % sl] % 95;
+      if (!enc) sh = -sh;
+      b[i] = 32 + (c - 32 + sh + 95) % 95;
+    }
+  }
+}
+
+void myLoraSave() {
+  myPrefs.begin("lora", false);
+  myPrefs.putString("name", myLoraName);
+  myPrefs.putInt("ch", myLoraChannel);
+  myPrefs.putBool("enc", myLoraEncrypt);
+  myPrefs.putString("seed", myLoraSeed);
+  myPrefs.putInt("rep", myLoraReportSec);
+  myPrefs.putInt("conf", myLoraMinConf);
+  myPrefs.end();
+}
+
+void myLoraLoad() {
+  myPrefs.begin("lora", false);
+  myPrefs.getString("name", MY_DEFAULT_NAME).toCharArray(myLoraName, sizeof(myLoraName));
+  myLoraChannel   = myPrefs.getInt("ch", MY_DEFAULT_CHANNEL);
+  myLoraEncrypt   = myPrefs.getBool("enc", MY_DEFAULT_ENCRYPT);
+  myPrefs.getString("seed", MY_DEFAULT_SEED).toCharArray(myLoraSeed, sizeof(myLoraSeed));
+  myLoraReportSec = myPrefs.getInt("rep", MY_DEFAULT_REPORT_SEC);
+  myLoraMinConf   = myPrefs.getInt("conf", MY_DEFAULT_MIN_CONF);
+  myPrefs.end();
+}
+
+// Machine line for the page: name, channel, settings and the class names.
+void myLoraPrintInfo(bool force) {
+  if (!force && !myDebugStream) return;
+  myLoraInfoLast = millis();
+  String s = String("@LORA-INFO name=") + myLoraName + " ch=" + myLoraChannel + " report=" + myLoraReportSec +
+             " conf=" + myLoraMinConf + " radio=" + (myLoraOk ? "ok" : "off") + " auto=0 classes=";
+  for (int i = 0; i < NUM_CLASSES; i++) { if (i) s += ','; s += myClassLabels[i]; }
+  myLkEmit(s.c_str(), s.length());
+}
+
+void myLoraBegin() {
+  // SD card and camera start-up can leave the shared SPI pins changed: set the bus up again, both chip selects high.
+  pinMode(MY_SD_CS, OUTPUT);
+  pinMode(LORA_NSS, OUTPUT);
+  SPI.begin();
+  digitalWrite(MY_SD_CS, HIGH);
+  digitalWrite(LORA_NSS, HIGH);
+  myLoraLoad();
+  Serial.print("[SX1262] init ... ");
+  int st = myRadio.begin(myLoraFreq(), 125.0, 9, 7, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, 22, 8, MY_LORA_TCXO_V);
+  if (st != RADIOLIB_ERR_NONE) {
+    Serial.printf("failed, code %d. LoRa is OFF (check wiring and the antenna).\n", st);
+  } else {
+    myRadio.setDio2AsRfSwitch(MY_LORA_DIO2_RF);
+#if MY_LORA_RXEN >= 0 || MY_LORA_TXEN >= 0
+    myRadio.setRfSwitchPins(MY_LORA_RXEN, MY_LORA_TXEN);
+#endif
+    myRadio.setSyncWord(0x3444);
+    myRadio.setDio1Action(myLoraIsr);
+    myLoraOk = (myRadio.startReceive() == RADIOLIB_ERR_NONE);
+    Serial.println(myLoraOk ? "ready" : "receive failed");
+  }
+  myLoraWinStart = millis();
+  myLoraNext = millis() + 5000 + random(myLoraReportSec * 1000L);   // random first report so boards do not collide
+}
+
+// Called for every inferred frame.
+void myLoraCount(int pred, float p) {
+  myLoraFrames++;
+  if (pred >= 0 && pred < NUM_CLASSES && p * 100.0f >= myLoraMinConf) myLoraCounts[pred]++;
+}
+
+void myLoraStamp(char* out, size_t n) {
+  unsigned long s = millis() / 1000UL;
+  if (myLoraClockBase >= 0) {
+    s = (s + (unsigned long)myLoraClockBase) % 86400UL;
+    snprintf(out, n, "%02lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
+  } else {
+    snprintf(out, n, "T+%02lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
+  }
+}
+
+// Turns "S,<name>,<seq>,<period>,<frames>,<c0>,<c1>,..." into words. Returns false when it is not a summary.
+bool myLoraExplain(const char* pkt, char* name, size_t nn, char* out, size_t n) {
+  if (pkt[0] != 'S' || pkt[1] != ',') return false;
+  char tmp[MY_LORA_MAX + 40];
+  strncpy(tmp, pkt, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+  char* sp;
+  strtok_r(tmp, ",", &sp);
+  char* nm  = strtok_r(NULL, ",", &sp);
+  char* seq = strtok_r(NULL, ",", &sp);
+  char* per = strtok_r(NULL, ",", &sp);
+  char* frm = strtok_r(NULL, ",", &sp);
+  if (!nm || !seq || !per || !frm) return false;
+  strncpy(name, nm, nn - 1); name[nn - 1] = 0;
+  long frames = atol(frm), sum = 0;
+  int len = snprintf(out, n, "summary #%s: %s s window, %s frames ->", seq, per, frm);
+  int i = 0;
+  for (char* c = strtok_r(NULL, ",", &sp); c && len < (int)n - 24; c = strtok_r(NULL, ",", &sp), i++) {
+    long v = atol(c);
+    sum += v;
+    if (i < NUM_CLASSES) len += snprintf(out + len, n - len, "%s %s %ld", i ? "," : "", myClassLabels[i].c_str(), v);
+    else                 len += snprintf(out + len, n - len, "%s class%d %ld", i ? "," : "", i, v);
+  }
+  if (frames > sum && len < (int)n - 24) snprintf(out + len, n - len, ", unsure %ld", frames - sum);
+  return true;
+}
+
+// Sends one packet and says what was sent. Returns true when the radio accepted it.
+bool myLoraTransmit(char* pkt) {
+  char st[16]; myLoraStamp(st, sizeof(st));
+  int len = strlen(pkt);
+  if (!myLoraOk)    { myLoraSay("[%s] LoRa NOT SENT, the radio is off (check wiring): %s", st, pkt); return false; }
+  if (myLoraTxBusy) { myLoraSay("[%s] LoRa NOT SENT, the radio is still busy, try again: %s", st, pkt); return false; }
+  unsigned long air = (unsigned long)(myRadio.getTimeOnAir(len) / 1000);
+  char nm[24], ex[200];
+  const char* enc = myLoraEncrypt ? ", encrypted" : "";
+  bool isSummary = myLoraExplain(pkt, nm, sizeof(nm), ex, sizeof(ex));
+  if (isSummary) myLoraSay("[%s] LoRa SENT %s  (%d bytes, ~%lu ms on air%s)", st, ex, len, air, enc);
+  else           myLoraSay("[%s] LoRa SENT message: \"%s\"  (%d bytes, ~%lu ms on air%s)", st, pkt, len, air, enc);
+  char plain[MY_LORA_MAX + 40];
+  strncpy(plain, pkt, sizeof(plain) - 1); plain[sizeof(plain) - 1] = 0;
+  if (myLoraEncrypt) myLoraCipher(pkt, true);
+  digitalWrite(MY_SD_CS, HIGH);   // SD card deselected before LoRa SPI activity
+  myRadio.standby();
+  if (myRadio.startTransmit(pkt) == RADIOLIB_ERR_NONE) {
+    myLoraTxBusy = true; myLoraTxStart = millis(); myLoraTxN++;
+    if (!isSummary) myLoraSay("@LORA-MSG self 0 %s", plain);   // machine line for the page
+    return true;
+  }
+  myLoraErrN++; myRadio.startReceive();
+  myLoraSay("[%s] LoRa SEND FAILED, the radio did not start sending", st);
+  return false;
+}
+
+// Chat line: "<name>: <text>"
+bool myLoraSendText(const char* text) {
+  while (*text == ' ') text++;
+  if (!*text) { myLoraSay("[E] nothing to send. Use  @lora your text"); return false; }
+  char pkt[MY_LORA_MAX + 1];
+  int need = snprintf(pkt, sizeof(pkt), "%s: %s", myLoraName, text);
+  if (need >= (int)sizeof(pkt)) myLoraSay("[note] message cut to %d characters (the limit includes \"%s: \")", (int)sizeof(pkt) - 1, myLoraName);
+  return myLoraTransmit(pkt);
+}
+
+void myLoraReport() {
+  unsigned long now = millis();
+  unsigned long period = (now - myLoraWinStart + 500) / 1000;
+  myLoraNext = now + (unsigned long)myLoraReportSec * 10UL * (90 + random(21));   // 90..110 % of the period
+  if (myLoraFrames == 0) { myLoraWinStart = now; return; }                       // not inferring: nothing to say
+  char pkt[MY_LORA_MAX];
+  int n = snprintf(pkt, sizeof(pkt), "S,%s,%lu,%lu,%lu", myLoraName, myLoraSeq, period, (unsigned long)myLoraFrames);
+  for (int i = 0; i < NUM_CLASSES && n < (int)sizeof(pkt) - 8; i++) n += snprintf(pkt + n, sizeof(pkt) - n, ",%u", myLoraCounts[i]);
+  myLoraSay("@LORA self 0 %s", pkt);
+  if (myLoraOk) myLoraTransmit(pkt);
+  myLoraSeq++;
+  memset(myLoraCounts, 0, sizeof(myLoraCounts));
+  myLoraFrames = 0;
+  myLoraWinStart = now;
+}
+
+void myLoraService() {
+  unsigned long now = millis();
+  if (myLoraOk && myLoraFlag) {
+    myLoraFlag = false;
+    if (myLoraTxBusy) {
+      myLoraTxBusy = false;
+      myRadio.startReceive();
+    } else {
+      String s;
+      int st = myRadio.readData(s);
+      if (st == RADIOLIB_ERR_NONE) {
+        myLoraRxN++;
+        char b[MY_LORA_MAX + 40];
+        s.toCharArray(b, sizeof(b));
+        if (myLoraEncrypt) myLoraCipher(b, false);
+        int rssi = (int)myRadio.getRSSI(); float snr = myRadio.getSNR();
+        char stp[16], nm[24], ex[200];
+        myLoraStamp(stp, sizeof(stp));
+        if (b[0] == 'S' && b[1] == ',') {
+          myLoraSay("@LORA %d %.1f %s", rssi, snr, b);
+          if (myLoraExplain(b, nm, sizeof(nm), ex, sizeof(ex))) myLoraSay("[%s] LoRa HEARD %s: %s  (%d dBm, SNR %.1f)", stp, nm, ex, rssi, snr);
+        } else {
+          myLoraSay("[%s] LoRa HEARD message: \"%s\"  (%d dBm, SNR %.1f)", stp, b, rssi, snr);
+          myLoraSay("@LORA-MSG %d %.1f %s", rssi, snr, b);
+        }
+      } else if (st != RADIOLIB_ERR_RX_TIMEOUT) {
+        myLoraErrN++;
+        myLoraSay("[E] LoRa read error %d", st);
+      }
+      myRadio.startReceive();
+    }
+  }
+  if (myLoraTxBusy && now - myLoraTxStart > 3000) { myLoraTxBusy = false; myLoraErrN++; myRadio.startReceive(); }
+  if (myLoraOk && !myLoraTxBusy && (long)(now - myLoraNext) >= 0) myLoraReport();
+  if (myDebugStream && now - myLoraInfoLast > 30000) myLoraPrintInfo(false);
+}
+
+void myLoraStatus() {
+  myLoraSay("LoRa: name %s, channel %d (%.1f MHz), radio %s, encryption %s", myLoraName, myLoraChannel, myLoraFreq(), myLoraOk ? "ok" : "OFF", myLoraEncrypt ? "on" : "off");
+  myLoraSay("LoRa: report every %d s, min confidence %d%%, sent %lu, heard %lu, errors %lu", myLoraReportSec, myLoraMinConf, myLoraTxN, myLoraRxN, myLoraErrN);
+}
+
+// Command lines (they start with a space so the page shows them as plain text).
+void myLoraHelp() {
+  myLoraSay("LoRa commands (a setting typed alone shows its value):");
+  myLoraSay("  @lora <text>        send a message to every board listening (also @say <text>)");
+  myLoraSay("  @name <text>        this board's name in every report (now %s)", myLoraName);
+  myLoraSay("  @report <sec>       seconds between summaries while inferring, 5..3600 (now %d)", myLoraReportSec);
+  myLoraSay("  @conf <percent>     confidence a frame needs to count as a class (now %d)", myLoraMinConf);
+  myLoraSay("  @channel <0..120>   915.0 MHz + channel x 0.1 MHz, all boards must match (now %d)", myLoraChannel);
+  myLoraSay("  @encrypt on|off     scramble the text with the seed (now %s)", myLoraEncrypt ? "on" : "off");
+  myLoraSay("  @seed <text>        encryption seed, must match on all boards");
+  myLoraSay("  @time hh:mm[:ss]    set the clock used in the stamps (lost at reboot)");
+  myLoraSay("  @lorastatus         settings and counters      @lorareset  back to the defaults");
+}
+
+// Returns true when the line was a LoRa command.
+bool myLoraCommand(char* l) {
+  char* a;
+  if (l[0] == '>') { myLoraSendText(l + 1); return true; }
+  if (!strncasecmp(l, "@lora ", 6)) { myLoraSendText(l + 6); return true; }
+  if (!strncasecmp(l, "@say ", 5))  { myLoraSendText(l + 5); return true; }
+  if (!strcasecmp(l, "@lora") || !strcasecmp(l, "@say")) { myLoraSay("[E] use  @lora your text"); return true; }
+  if (!strcasecmp(l, "@lorastatus")) { myLoraStatus(); return true; }
+  if (!strcasecmp(l, "@pageinfo")) { myLoraPrintInfo(true); return true; }
+  if (!strcasecmp(l, "@lorareset")) {
+    myPrefs.begin("lora", false); myPrefs.clear(); myPrefs.end();
+    myLoraLoad();
+    if (myLoraOk) { myRadio.standby(); myRadio.setFrequency(myLoraFreq()); myRadio.startReceive(); }
+    myLoraNext = millis() + myLoraReportSec * 1000UL;
+    myLoraSay("[OK] LoRa settings are back to the defaults");
+    myLoraPrintInfo(true);
+    return true;
+  }
+  if (!strncasecmp(l, "@name", 5)) {
+    a = l + 5; while (*a == ' ') a++;
+    if (!*a) { myLoraSay("  @name = %s   change: @name <text>", myLoraName); return true; }
+    int n = 0;
+    for (; a[n] && n < (int)sizeof(myLoraName) - 1; n++) {
+      char c = a[n];
+      myLoraName[n] = (isalnum((unsigned char)c) || c == '-' || c == '_') ? c : '-';
+    }
+    myLoraName[n] = 0;
+    myLoraSave(); myLoraSay("[OK] name = %s (saved)", myLoraName); myLoraPrintInfo(true); return true;
+  }
+  if (!strncasecmp(l, "@report", 7)) {
+    a = l + 7; while (*a == ' ') a++;
+    if (!*a) { myLoraSay("  @report = %d s   change: @report <sec>", myLoraReportSec); return true; }
+    int v = atoi(a);
+    if (v < 5 || v > 3600) { myLoraSay("[E] report must be 5..3600 seconds"); return true; }
+    myLoraReportSec = v; myLoraSave(); myLoraNext = millis() + v * 1000UL;
+    myLoraSay("[OK] report every %d s (saved)", v); myLoraPrintInfo(true); return true;
+  }
+  if (!strncasecmp(l, "@conf", 5)) {
+    a = l + 5; while (*a == ' ') a++;
+    if (!*a) { myLoraSay("  @conf = %d%%   change: @conf <percent>", myLoraMinConf); return true; }
+    int v = atoi(a);
+    if (v < 0 || v > 100) { myLoraSay("[E] conf must be 0..100"); return true; }
+    myLoraMinConf = v; myLoraSave(); myLoraSay("[OK] min confidence %d%% (saved)", v); myLoraPrintInfo(true); return true;
+  }
+  if (!strncasecmp(l, "@channel", 8)) {
+    a = l + 8; while (*a == ' ') a++;
+    if (!*a) { myLoraSay("  @channel = %d (%.1f MHz)   change: @channel <0..120>", myLoraChannel, myLoraFreq()); return true; }
+    int ch = atoi(a);
+    if (ch < 0 || ch > 120) { myLoraSay("[E] channel must be 0..120"); return true; }
+    myLoraChannel = ch; myLoraSave();
+    if (myLoraOk) {
+      myRadio.standby(); int st = myRadio.setFrequency(myLoraFreq()); myRadio.startReceive();
+      if (st == RADIOLIB_ERR_NONE) myLoraSay("[OK] channel %d (%.1f MHz, saved)", ch, myLoraFreq());
+      else myLoraSay("[E] frequency change failed (%d)", st);
+    } else myLoraSay("[OK] channel %d (%.1f MHz, saved; the radio is off)", ch, myLoraFreq());
+    myLoraPrintInfo(true); return true;
+  }
+  if (!strncasecmp(l, "@encrypt", 8)) {
+    a = l + 8; while (*a == ' ') a++;
+    if (!*a) { myLoraSay("  @encrypt = %s   change: @encrypt on|off", myLoraEncrypt ? "on" : "off"); return true; }
+    if (!strcasecmp(a, "on") || !strcmp(a, "1")) myLoraEncrypt = true;
+    else if (!strcasecmp(a, "off") || !strcmp(a, "0")) myLoraEncrypt = false;
+    else { myLoraSay("[E] use  @encrypt on  or  @encrypt off"); return true; }
+    myLoraSave(); myLoraSay("[OK] encryption %s (saved)", myLoraEncrypt ? "ON" : "OFF"); return true;
+  }
+  if (!strncasecmp(l, "@seed", 5)) {
+    a = l + 5; while (*a == ' ') a++;
+    if (!*a) { myLoraSay("  @seed = %s   change: @seed <text>", myLoraSeed); return true; }
+    strncpy(myLoraSeed, a, sizeof(myLoraSeed) - 1); myLoraSeed[sizeof(myLoraSeed) - 1] = 0;
+    myLoraSave(); myLoraSay("[OK] seed updated (saved)"); return true;
+  }
+  if (!strncasecmp(l, "@time", 5)) {
+    int h, m, sec = 0;
+    if (l[5] == 0) { char st[16]; myLoraStamp(st, sizeof(st)); myLoraSay("  @time = %s   change: @time hh:mm[:ss]", st); return true; }
+    int got = sscanf(l + 5, "%d:%d:%d", &h, &m, &sec);
+    if (got < 2 || h < 0 || h > 23 || m < 0 || m > 59 || sec < 0 || sec > 59) { myLoraSay("[E] use  @time hh:mm  or  @time hh:mm:ss  (24 hour clock)"); return true; }
+    long tod = h * 3600L + m * 60L + sec;
+    myLoraClockBase = (tod + 86400L - (long)((millis() / 1000UL) % 86400UL)) % 86400L;
+    myLoraSay("[OK] clock set (not saved, lost at reboot)"); return true;
+  }
+  return false;
+}
+#else
+// LoRa left out (MY_USE_LORA 0): empty stand-ins so the rest of the sketch is unchanged.
+void myLoraBegin() {}
+void myLoraService() {}
+void myLoraCount(int pred, float p) {}
+void myLoraHelp() {}
+bool myLoraCommand(char* l) { return false; }
+#endif
+
 void myLkPoll() {
 #if MY_USE_WIFI
   if (myWifiUp) myWs.loop();
 #endif
   myBleService();                       // commands that arrived over Bluetooth
   myLkServeSnap();                      // answer a "@snap" request (works on every link)
+  myLoraService();                      // LoRa receive, report and transmit
 }
 
 // One line to the USB serial and to the WiFi page (when connected).
@@ -1384,7 +1819,14 @@ void myLkHandleLine(const String& line) {
   if (line.startsWith("@w"))     { myLkPutChunk(line); return; }
   if (line == "@snap") { myLkSnapWanted = true; return; }          // answered in myLkPoll()
   if (line == "@info") { myLkInfo(); return; }
+  if (line == "@help") { myLkHelp(); return; }
+  if (line == "@menu") { myLkMenu(); return; }
   if (line.startsWith("@cfg ")) { myLkWriteConfig(line.substring(5)); return; }
+  {
+    char myCmdBuf[160];
+    line.toCharArray(myCmdBuf, sizeof(myCmdBuf));
+    if (myLoraCommand(myCmdBuf)) return;              // LoRa commands (v009)
+  }
   myLkReply("E,unknown command");
 }
 
@@ -1445,7 +1887,7 @@ void myLkServeSnap() {
 
 // "@info" -> Y,info|version|input size|conv1|conv2|class names|sd=0/1|w=0/1
 void myLkInfo() {
-  String s = String("Y,info|v004|") + String((int)INPUT_SIZE) + "|" + String((int)CONV1_FILTERS) + "|" + String((int)CONV2_FILTERS) + "|";
+  String s = String("Y,info|v009|") + String((int)INPUT_SIZE) + "|" + String((int)CONV1_FILTERS) + "|" + String((int)CONV2_FILTERS) + "|";
   for (int i = 0; i < NUM_CLASSES; i++) { if (i) s += ","; s += myClassLabels[i]; }
   s += mySDavailable ? "|sd=1" : "|sd=0";
   s += myWeightsTrained ? "|w=1" : "|w=0";
@@ -1664,10 +2106,13 @@ void myLkBleBegin() {
   NimBLECharacteristic* rx = svc->createCharacteristic(MY_BLE_RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
   rx->setCallbacks(new MyBleRxCb());
   svc->start();
+  // Name only. A 128-bit service id plus the name does not fit in one 31 byte advertising packet, and the page
+  // finds the board by its name (it asks for the service after connecting). This is the pattern that connects
+  // in the working dual-board BLE sketch.
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->addServiceUUID(MY_BLE_SERVICE_UUID);
-  adv->enableScanResponse(true);
-  adv->start();
+  adv->setName(myBleName);
+  bool myAdvOk = adv->start();
+  if (!myAdvOk) Serial.println("ERROR: Bluetooth advertising failed to start, the page will not see the board");
   Serial.printf("Bluetooth ready. In the page press Connect Bluetooth and pick \"%s\"\n", myBleName);
 #endif
 }
@@ -2477,6 +2922,7 @@ void myActionInfer() {
       for (int i = 1; i < NUM_CLASSES; i++) {
         if (myDense_output[i] > myDense_output[pred]) pred = i;
       }
+      myLoraCount(pred, myDense_output[pred]);   // counted for the next LoRa summary
 
       // Every 10th frame: update the OLED and the web page (myRgbBuffer is still valid here).
       if (frameIndex == 9) {
@@ -2540,14 +2986,23 @@ void myResetMenuState() {
   myDrawMenu();
 }
 
-void myDrawMenu() {
-  // ---- Serial menu ----
-  Serial.println("\n=== MENU ===");
+// One menu or help line to USB, WiFi and Bluetooth (the page shows it in the device output box).
+void myMenuSay(const String& s) {
+  myLkEmit(s.c_str(), s.length());
+}
+
+// The text menu on every link that is open.
+void myPrintMenuText() {
+  myMenuSay("=== MENU ===");
   for (int i = 1; i <= myTotalItems; i++) {
-    Serial.print(i == myMenuIndex ? " > " : "   ");
-    Serial.printf("%d. %s\n", i, myMenuLabel(i).c_str());
+    myMenuSay(String(i == myMenuIndex ? " > " : "   ") + String(i) + ". " + myMenuLabel(i));
   }
-  Serial.println("Keys (USB, or the page's remote buttons over WiFi): t = next (tap)   l = select (long press)   or the item's number");
+  myMenuSay("Keys: t = next (tap)   l = select (long press)   or the item's number   |   @help lists everything");
+}
+
+void myDrawMenu() {
+  // ---- Text menu: USB, WiFi and Bluetooth ----
+  myPrintMenuText();
 
   // ---- OLED menu: three rows, scrolled so the chosen item is always visible ----
   int myStartItem = myMenuIndex - 1;
@@ -2566,6 +3021,44 @@ void myDrawMenu() {
       u8g2.drawStr(0, 18 + i * 9, line.c_str());
     }
   } while (u8g2.nextPage());
+}
+
+// "@menu": show the main menu again. While an item is running the OLED belongs to it, so only the text is printed.
+void myLkMenu() {
+  if (myIsSelected) {
+    myMenuSay("An item is running. Send x or l to stop it, then @menu draws the menu again.");
+    myPrintMenuText();
+    return;
+  }
+  myDrawMenu();
+}
+
+// "@help": every key and command, then the menu. Lines start with a space so the page shows them as plain text.
+void myLkHelp() {
+  static const char* const myHelpLines[] = {
+    "=== HELP (firmware-v009) ===",
+    "Keys (USB, WiFi, Bluetooth or the page's remote buttons):",
+    "  t        next item / capture a picture",
+    "  l        select / exit",
+    "  x        stop training",
+    "  1 .. 9   jump to a menu item",
+    "Commands:",
+    "  @help                          this list, then the menu",
+    "  @menu                          show the main menu again",
+    "  @info                          layout, class names, SD card and weights",
+    "  @snap                          one camera picture",
+    "  @ls <folder>                   list a folder, e.g. @ls /images",
+    "  @stat <path>                   size of a file",
+    "  @read <offset> <len> <path>    one piece of a file",
+    "  @put <bytes> <sum> <path>      start an image upload",
+    "  @cfg <json>                    save /header/config.json",
+    "  @model <bytes> <sum>           start a weights push",
+    "Page only: D / d turn debug frames on / off."
+  };
+  const int myHelpCount = (int)(sizeof(myHelpLines) / sizeof(myHelpLines[0]));
+  for (int i = 0; i < myHelpCount; i++) myMenuSay(myHelpLines[i]);
+  myLoraHelp();
+  myPrintMenuText();
 }
 
 void myExecuteMenuItem(int idx) {
